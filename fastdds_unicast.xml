@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  FastDDS unicast-discovery profile.
+  Use when the network (e.g. Google/Nest WiFi) blocks multicast between
+  wireless clients, which breaks ROS 2's default discovery.
+  It adds the robot's IP as an "initial peer" so discovery uses unicast.
+
+  Activate with:
+    export FASTRTPS_DEFAULT_PROFILES_FILE=/home/madee/Documents/ttb-experiments/fastdds_unicast.xml
+-->
+<dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <profiles>
+    <participant profile_name="unicast_discovery" is_default_profile="true">
+      <rtps>
+        <builtin>
+          <initialPeersList>
+            <!-- The TurtleBot3 -->
+            <locator>
+              <udpv4>
+                <address>192.168.68.100</address>
+              </udpv4>
+            </locator>
+            <!-- This laptop (loopback for local nodes) -->
+            <locator>
+              <udpv4>
+                <address>192.168.68.113</address>
+              </udpv4>
+            </locator>
+          </initialPeersList>
+        </builtin>
+      </rtps>
+    </participant>
+  </profiles>
+</dds>

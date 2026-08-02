@@ -1,0 +1,493 @@
+\documentclass[11pt,a4paper]{article}
+
+% ---------------------------------------------------------------------------
+%  Packages
+% ---------------------------------------------------------------------------
+\usepackage[margin=1in]{geometry}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{enumitem}
+\usepackage{parskip}
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric, arrows.meta, positioning, fit}
+\usepackage{fancyhdr}
+\usepackage[hidelinks]{hyperref}
+
+% ---------------------------------------------------------------------------
+%  Styling
+% ---------------------------------------------------------------------------
+\definecolor{codebg}{RGB}{245,245,245}
+\definecolor{codekw}{RGB}{0,90,160}
+\definecolor{codecmt}{RGB}{100,120,100}
+\definecolor{accent}{RGB}{40,90,200}
+
+\lstset{
+  backgroundcolor=\color{codebg},
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{codekw}\bfseries,
+  commentstyle=\color{codecmt}\itshape,
+  breaklines=true,
+  frame=single,
+  rulecolor=\color{gray!40},
+  columns=fullflexible,
+  showstringspaces=false,
+  xleftmargin=8pt,
+  aboveskip=8pt,belowskip=8pt,
+}
+\lstdefinestyle{bash}{language=bash}
+\lstdefinestyle{py}{language=Python}
+
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{\small TurtleBot3 Motion Server}
+\lhead{\small\leftmark}
+\cfoot{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+\newcommand{\code}[1]{\texttt{#1}}
+
+% ---------------------------------------------------------------------------
+%  Title
+% ---------------------------------------------------------------------------
+\title{\vspace{-1cm}\textbf{TurtleBot3 Motion Server}\\[4pt]
+       \large Design, Setup, and Operation Guide\\[2pt]
+       \normalsize A browser-based teleoperation and camera-streaming system}
+\author{\texttt{ttb-experiments}}
+\date{\today}
+
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+
+\begin{abstract}
+\noindent This document explains, from the ground up, a system that lets you
+\textbf{drive a TurtleBot3 robot from a web browser} while watching its camera
+in real time. It assumes \emph{no prior knowledge of ROS} (the Robot Operating
+System) or robotics. It covers the underlying concepts, the software that was
+written, the network and configuration issues that were solved along the way,
+and complete step-by-step instructions to start, use, and stop the system.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% ===========================================================================
+\section{Introduction}
+% ===========================================================================
+Imagine a small wheeled robot with a camera on top. This project lets you open
+a web page on your laptop, see through the robot's camera, and press buttons
+(or use the keyboard) to drive it around --- forward, backward, and turning ---
+all wirelessly. We call this \textbf{teleoperation}, or ``teleop'' for short:
+operating a machine from a distance.
+
+The whole thing is one Python program, \code{motion\_server.py}, that runs on a
+laptop. It does three jobs at once:
+\begin{enumerate}[noitemsep]
+  \item Receives the live camera images from the robot and shows them in the browser.
+  \item Sends your button presses to the robot as movement commands.
+  \item Serves a web page (the graphical user interface, or \textbf{GUI}) that
+        ties it all together.
+\end{enumerate}
+
+\paragraph{The equipment.} There are two computers involved:
+\begin{itemize}[noitemsep]
+  \item The \textbf{TurtleBot3} (model ``Burger'') --- a small robot whose brain
+        is a Raspberry Pi. It has two motors, a spinning distance sensor
+        (a lidar), and a USB camera.
+  \item Your \textbf{laptop} --- where the web server runs and where you open the
+        browser.
+\end{itemize}
+They talk to each other over Wi-Fi.
+
+% ===========================================================================
+\section{A Crash Course for Total Beginners}
+% ===========================================================================
+This section explains just enough background to understand everything else.
+If you already know ROS, skip to Section~\ref{sec:arch}.
+
+\subsection{What is ROS 2?}
+\textbf{ROS 2} (Robot Operating System 2) is not really an operating system ---
+it is a \emph{toolkit} for building robot software. Its most important idea is
+that a robot's software is split into many small programs called \textbf{nodes},
+and these nodes talk to each other by passing \textbf{messages}.
+
+\subsection{Topics: the robot's ``radio channels''}
+Nodes communicate over named channels called \textbf{topics}. Think of a topic
+as a radio frequency with a name, like \code{/cmd\_vel} or \code{/image}.
+\begin{itemize}[noitemsep]
+  \item A node that \textbf{publishes} to a topic is a broadcaster.
+  \item A node that \textbf{subscribes} to a topic is a listener.
+\end{itemize}
+Any number of listeners can tune in. In our system:
+\begin{itemize}[noitemsep]
+  \item The robot's camera node \textbf{publishes} pictures on the topic
+        \code{/image/compressed}. Our server \textbf{subscribes} to it.
+  \item Our server \textbf{publishes} movement commands on the topic
+        \code{/cmd\_vel}. The robot's motor node \textbf{subscribes} to it.
+\end{itemize}
+
+\subsection{Messages: Twist and images}
+Every message on a topic has a fixed shape (a ``type''):
+\begin{itemize}[noitemsep]
+  \item A movement command is a \textbf{Twist} message. It carries a
+        \emph{linear} speed (how fast to go forward/backward, in metres per
+        second) and an \emph{angular} speed (how fast to spin, in radians per
+        second). Sending \code{linear=0.1, angular=0} means ``drive forward
+        gently.'' Sending all zeros means ``stop.''
+  \item A camera picture is an \textbf{Image} (or \textbf{CompressedImage}, which
+        is the same picture squeezed smaller --- like a JPEG --- so it travels
+        faster over Wi-Fi). Our robot sends the compressed kind.
+\end{itemize}
+
+\subsection{How two computers find each other: the Domain ID}
+\label{sec:domain}
+ROS 2 nodes discover each other automatically over the network using a system
+called \textbf{DDS}. To keep separate robot projects from interfering, every
+node belongs to a \textbf{ROS\_DOMAIN\_ID} --- a number from 0 to 232. \emph{Two
+computers can only see each other's topics if they share the same
+ROS\_DOMAIN\_ID.} In this project both the robot and the laptop use
+\textbf{domain 203}. (A mismatch here was one of the first bugs we hit ---
+see Section~\ref{sec:fixes}.)
+
+% ===========================================================================
+\section{System Architecture}
+\label{sec:arch}
+% ===========================================================================
+Figure~\ref{fig:arch} shows how data flows. The camera images travel
+\emph{from} the robot \emph{to} the browser; the drive commands travel the
+other way.
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+  box/.style={rectangle, rounded corners, draw=accent, thick, fill=blue!5,
+              minimum width=3.2cm, minimum height=1.1cm, align=center},
+  robotbox/.style={rectangle, rounded corners, draw=green!50!black, thick,
+              fill=green!8, minimum width=3.2cm, minimum height=1.1cm, align=center},
+  arrow/.style={-{Stealth[length=3mm]}, thick},
+  lbl/.style={font=\footnotesize\itshape}
+]
+% robot side
+\node[robotbox] (cam) {Camera node\\\code{/image/compressed}};
+\node[robotbox, below=0.5cm of cam] (motor) {Motor node\\subscribes \code{/cmd\_vel}};
+\node[draw=green!50!black, thick, dashed, inner sep=12pt, fit=(cam)(motor),
+      label=above:{\textbf{TurtleBot3 (Raspberry Pi)}}] (robot) {};
+
+% laptop side
+\node[box, right=4.5cm of cam] (sub) {Motion server\\(subscribes camera)};
+\node[box, below=0.5cm of sub] (pub) {Motion server\\(publishes \code{/cmd\_vel})};
+\node[box, right=1.6cm of sub, yshift=-1.0cm] (browser) {Web browser\\(the GUI)};
+\node[draw=accent, thick, dashed, inner sep=12pt, fit=(sub)(pub),
+      label=above:{\textbf{Laptop}}] (laptop) {};
+
+% arrows
+\draw[arrow] (cam.east) -- node[lbl, above]{images} (sub.west);
+\draw[arrow] (pub.west) -- node[lbl, below]{Twist} (motor.east);
+\draw[arrow] (sub.east) -- node[lbl, above, xshift=2mm]{MJPEG} (browser.west);
+\draw[arrow] (browser.south) |- (pub.east);
+\end{tikzpicture}
+\caption{Data flow. Left: the robot. Right: the laptop. Camera images flow
+right; drive commands flow left. Wi-Fi carries the ROS~2 traffic between them.}
+\label{fig:arch}
+\end{figure}
+
+\noindent The two dashed boxes are the two computers. Inside the laptop, the
+single \code{motion\_server.py} program plays several roles: it subscribes to the
+camera, re-serves those frames to the browser as a video stream, and turns your
+clicks into \code{/cmd\_vel} messages.
+
+% ===========================================================================
+\section{Hardware and Network Configuration}
+% ===========================================================================
+Table~\ref{tab:config} lists every setting the system depends on. All of these
+live in a single \code{.env} file so they are easy to change (see
+Appendix~\ref{app:env}).
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Setting} & \textbf{Value} & \textbf{Meaning} \\
+\midrule
+Robot IP        & \code{192.168.68.100} & Address of the robot on the Wi-Fi \\
+Laptop IP       & \code{192.168.68.113} & Address of the laptop \\
+Robot login     & \code{ubuntu}         & SSH username on the robot \\
+ROS\_DOMAIN\_ID & \code{203}            & Shared ``channel group'' (Sec.~\ref{sec:domain}) \\
+Robot model     & \code{burger}         & The TurtleBot3 variant \\
+Lidar model     & \code{LDS-01}         & The distance sensor type \\
+Camera topic    & \code{/image/compressed} & Where images are published \\
+Command topic   & \code{/cmd\_vel}      & Where drive commands go \\
+Max linear speed & \code{0.22} m/s      & Burger's top forward speed \\
+Max angular speed & \code{2.84} rad/s   & Burger's top turning speed \\
+Server port     & \code{8000}           & Web address is \code{localhost:8000} \\
+\bottomrule
+\end{tabular}
+\caption{System configuration.}
+\label{tab:config}
+\end{table}
+
+% ===========================================================================
+\section{What Was Built: The Motion Server}
+% ===========================================================================
+The entire application is the file \code{motion\_server.py}. Here is what each
+part does, in plain language.
+
+\subsection{Camera streaming}
+The server subscribes to the robot's camera topic. Each incoming compressed
+image is decoded into a picture. A special web address, \code{/video}, streams
+these pictures to the browser one after another (a technique called
+\textbf{MJPEG}), which the browser shows as a live video. The program can handle
+both ``raw'' and ``compressed'' image types and detects which one automatically.
+
+\subsection{Driving the robot}
+When you press a direction, the browser calls the address \code{/cmd} with a
+requested linear and angular speed. The server clamps those numbers to the
+robot's safe maximums and remembers them as the ``target velocity.''
+
+\subsection{Safety: the dead-man's switch}
+\label{sec:deadman}
+A robot that keeps moving after you lose connection is dangerous. To prevent
+this, the server re-sends the target velocity 20 times per second, but if no
+fresh command has arrived in the last \textbf{0.4 seconds} it automatically
+sends \emph{stop}. In practice this means: the robot moves only while you are
+actively holding a button or key; the instant you release --- or your browser or
+Wi-Fi drops --- it halts. This is called a \textbf{dead-man's switch}.
+
+\subsection{The web GUI}
+Figure~\ref{fig:gui} shows the interface. On the left is the live camera. On the
+right is the control panel:
+\begin{itemize}[noitemsep]
+  \item A 3$\times$3 grid of labelled buttons: \emph{Forward, Backward, Turn
+        Left, Turn Right}, the four diagonals, and a large red \textbf{STOP} in
+        the centre.
+  \item A live velocity read-out ($v$ and $\omega$).
+  \item Sliders to set how fast forward driving and turning are.
+  \item A latency read-out (explained in Section~\ref{sec:latency}).
+\end{itemize}
+You can also drive with the keyboard: \textbf{W/A/S/D} or the arrow keys, and
+\textbf{Space} or \textbf{X} to stop. Press-and-hold to move; release to stop.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{images/gui.png}
+\caption{The web GUI. Camera feed on the left; full teleop control panel on the
+right with directional buttons, STOP, speed sliders, and the latency read-out.}
+\label{fig:gui}
+\end{figure}
+
+\subsection{Teleop latency read-out}
+\label{sec:latency}
+The amber line under the velocity read-out estimates how long it takes for a
+button press to reach the robot as motion. It is built from a live measurement
+of the network \textbf{round-trip time} plus fixed allowances for internal
+processing --- see Section~\ref{sec:latencymath} for the full explanation.
+
+% ===========================================================================
+\section{Problems Encountered and How They Were Solved}
+\label{sec:fixes}
+% ===========================================================================
+Getting the system working surfaced several real-world issues. They are
+documented here because they are common and instructive.
+
+\begin{description}
+  \item[Nothing was visible at first.] The robot was powered on but its ROS
+        software had not been started. Powering on a robot is not the same as
+        launching its programs --- the motor and camera nodes must be started
+        explicitly.
+  \item[Domain ID mismatch.] The robot's start-up file (\code{.bashrc}) set the
+        ROS\_DOMAIN\_ID \emph{five} times with conflicting values; the last one
+        won, leaving the robot on domain 0 while the laptop was on 203. Because
+        of the rule in Section~\ref{sec:domain}, they could not see each other.
+        The file was cleaned to set a single, consistent value (203).
+  \item[Missing lidar model.] Launching the robot failed with
+        \code{KeyError: 'LDS\_MODEL'} because the lidar type was not set in the
+        environment. Setting \code{LDS\_MODEL=LDS-01} fixed it.
+  \item[SSH dropping on launch.] Every time the robot software started, the
+        remote terminal connection reset (a Wi-Fi hiccup under the sudden burst
+        of network traffic). The fix was to launch the robot programs
+        \emph{detached}, so they keep running even if the terminal disconnects.
+  \item[Multicast worry.] The home Wi-Fi (a \code{192.168.68.x} network, typical
+        of Google/Nest routers) was suspected of blocking the ``multicast''
+        traffic ROS uses to discover nodes. A unicast fall-back configuration
+        (\code{fastdds\_unicast.xml}) was prepared, but testing showed multicast
+        actually worked, so the default is used.
+\end{description}
+
+% ===========================================================================
+\section{How to Run Everything}
+% ===========================================================================
+This is the complete operating procedure.
+
+\subsection{One-time setup}
+\begin{lstlisting}[style=bash]
+# Copy the configuration template and fill in your values
+cp .env.example .env
+nano .env        # set ROBOT_IP, ROBOT_PASSWORD, ROS_DOMAIN_ID, etc.
+\end{lstlisting}
+
+\subsection{Step 1 --- Start the robot's software}
+This starts the motor driver and the camera on the robot, over SSH:
+\begin{lstlisting}[style=bash]
+./scripts/robot_start.sh
+\end{lstlisting}
+It launches everything on the correct domain and waits for it to come up. You can
+confirm the robot's topics are visible from the laptop with:
+\begin{lstlisting}[style=bash]
+export ROS_DOMAIN_ID=203
+ros2 topic list        # you should see /cmd_vel, /image/compressed, /scan, ...
+\end{lstlisting}
+
+\subsection{Step 2 --- Start the web server}
+\begin{lstlisting}[style=bash]
+./run_server.sh
+\end{lstlisting}
+
+\subsection{Step 3 --- Open the GUI and drive}
+Open \url{http://localhost:8000} in a browser (or
+\code{http://192.168.68.113:8000} from your phone on the same Wi-Fi). Drive with
+the buttons or keyboard. \emph{Watch the robot while you drive.}
+
+\subsection{Step 4 --- Shut down}
+\begin{lstlisting}[style=bash]
+# Stop the web server:  press Ctrl-C in its terminal, or:
+pkill -f motion_server.py
+
+# Stop the robot's ROS nodes (robot stays powered on):
+./scripts/robot_stop.sh
+\end{lstlisting}
+
+\subsection{Step 5 --- Power off the robot (optional)}
+Always shut the Raspberry Pi down cleanly before cutting power, to avoid
+corrupting its memory card:
+\begin{lstlisting}[style=bash]
+ssh ubuntu@192.168.68.100 'sudo poweroff'
+# wait ~20 s for the green light to stop blinking, then flip the power switch
+\end{lstlisting}
+
+% ===========================================================================
+\section{Understanding Teleop Latency}
+\label{sec:latencymath}
+% ===========================================================================
+\textbf{Latency} is the delay between doing something and seeing the effect.
+For teleop, it is the time from pressing a button to the wheels actually turning.
+
+The most important and variable part is the \textbf{Round-Trip Time (RTT)}: how
+long a small network packet takes to travel from the laptop to the robot
+\emph{and back}. The server measures this live (it appears as ``link RTT'' in the
+GUI). A typical value on this setup is about 20\,ms; if the Wi-Fi degrades, this
+number climbs and driving feels sluggish.
+
+A command only needs to travel \emph{one way} (laptop $\rightarrow$ robot), which
+is about half the RTT. The GUI's estimate therefore adds up:
+\[
+\text{latency} \;\approx\;
+\underbrace{\tfrac{1}{2}\,\text{RTT}}_{\text{network, one way}}
+\;+\;
+\underbrace{50\,\text{ms}}_{\text{command cycle (20 Hz)}}
+\;+\;
+\underbrace{\sim 30\,\text{ms}}_{\text{motor response}}.
+\]
+For a 20\,ms RTT this gives roughly 10--90\,ms. Note this is a well-grounded
+\emph{estimate}: only the RTT is measured directly; the other terms are known
+constants of the system.
+
+% ===========================================================================
+\section{Troubleshooting}
+% ===========================================================================
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}p{5.3cm}p{8.5cm}@{}}
+\toprule
+\textbf{Symptom} & \textbf{Likely cause and fix} \\
+\midrule
+\code{ros2 topic list} shows nothing from the robot &
+Robot software not started (run \code{robot\_start.sh}), or domain mismatch
+(both must be \code{ROS\_DOMAIN\_ID=203}). \\
+GUI says ``waiting for camera'' but the robot drives &
+Wrong camera topic; check \code{ros2 topic list} and \code{IMAGE\_TOPIC} in \code{.env}. \\
+Camera shows but robot will not move &
+Wrong command topic, or the robot's motor node is not running. \\
+Robot launch fails: \code{KeyError: 'LDS\_MODEL'} &
+Set \code{LDS\_MODEL} (e.g.\ \code{LDS-01}) before launching. \\
+SSH disconnects when starting the robot &
+Expected Wi-Fi hiccup; the scripts launch detached so the nodes survive. Just
+reconnect and check. \\
+Driving feels laggy &
+Check the ``link RTT'' in the GUI; a high value means poor Wi-Fi. \\
+\bottomrule
+\end{tabular}
+\caption{Common problems.}
+\end{table}
+
+% ===========================================================================
+\section{Repository Structure and Security}
+% ===========================================================================
+\begin{lstlisting}[style=bash]
+ttb-experiments/
+  motion_server.py          # the whole application (node + server + GUI)
+  run_server.sh             # start the server on the laptop (reads .env)
+  scripts/
+    robot_start.sh          # start the robot's ROS nodes over SSH
+    robot_stop.sh           # stop the robot's ROS nodes
+  fastdds_unicast.xml       # optional fall-back for multicast-blocking networks
+  .env.example              # configuration template (safe to share)
+  .env                      # YOUR real config incl. password (git-ignored!)
+  docs/
+    turtlebot3_motion_server.tex / .pdf   # this document
+    images/gui.png
+\end{lstlisting}
+
+\paragraph{Security note.} The robot's SSH password and other real values live
+only in \code{.env}, which is listed in \code{.gitignore} and is therefore
+\emph{never} committed or pushed to GitHub. Only \code{.env.example}, containing
+placeholders, is shared. Never put real passwords in a public repository ---
+automated bots scan GitHub for leaked credentials within minutes.
+
+% ===========================================================================
+\appendix
+\section{Environment Variable Reference}
+\label{app:env}
+% ===========================================================================
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Variable} & \textbf{Description} \\
+\midrule
+\code{ROBOT\_IP}        & Robot's IP address on the Wi-Fi. \\
+\code{LAPTOP\_IP}       & Laptop's IP address. \\
+\code{ROBOT\_USER}      & SSH username on the robot. \\
+\code{ROBOT\_PASSWORD}  & SSH password (secret; kept only in \code{.env}). \\
+\code{ROS\_DOMAIN\_ID}  & Shared discovery domain; must match on both machines. \\
+\code{TURTLEBOT3\_MODEL}& Robot variant (\code{burger}). \\
+\code{LDS\_MODEL}       & Lidar model (\code{LDS-01}). \\
+\code{IMAGE\_TOPIC}     & Topic the camera publishes on. \\
+\code{IMAGE\_TYPE}      & \code{compressed}, \code{raw}, or \code{auto}. \\
+\code{CMD\_VEL\_TOPIC}  & Topic drive commands are published on. \\
+\code{MAX\_LIN}         & Max linear speed (m/s). \\
+\code{MAX\_ANG}         & Max angular speed (rad/s). \\
+\code{SERVER\_PORT}     & Web server port. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Command Cheat-Sheet}
+\begin{lstlisting}[style=bash]
+# --- laptop ---
+./run_server.sh                       # start the web GUI server
+pkill -f motion_server.py             # stop it
+export ROS_DOMAIN_ID=203; ros2 topic list   # what the robot is publishing
+
+# --- robot (over SSH) ---
+./scripts/robot_start.sh              # start motors + camera
+./scripts/robot_stop.sh              # stop them
+ssh ubuntu@192.168.68.100 'sudo poweroff'    # clean power-off
+\end{lstlisting}
+
+\end{document}

@@ -1,0 +1,23 @@
+# --- Secrets: never commit real credentials -------------------------------
+.env
+
+# --- Python ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- LaTeX build artifacts ------------------------------------------------
+docs/*.aux
+docs/*.log
+docs/*.out
+docs/*.toc
+docs/*.fls
+docs/*.fdb_latexmk
+docs/*.synctex.gz
+
+# --- Editor / OS ----------------------------------------------------------
+.vscode/
+.DS_Store
+*.swp
