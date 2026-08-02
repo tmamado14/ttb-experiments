@@ -12,7 +12,10 @@ fi
 set -a; source .env; set +a
 
 # --- source ROS 2 ------------------------------------------------------------
+# ROS's setup scripts reference unset vars, so relax `set -u` while sourcing.
+set +u
 source /opt/ros/humble/setup.bash
+set -u
 export ROS_DOMAIN_ID
 unset FASTRTPS_DEFAULT_PROFILES_FILE   # default multicast discovery works here
 

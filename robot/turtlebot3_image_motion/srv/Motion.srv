@@ -1,0 +1,11 @@
+# Motion Service - Request velocity command
+# Client: Jetson Orin (web_controller)
+# Server: TurtleBot3 (motion_server)
+
+# Request
+float64 linear      # Linear velocity (m/s)
+float64 angular     # Angular velocity (rad/s)
+---
+# Response
+bool success        # True if command was executed
+string message      # Status message

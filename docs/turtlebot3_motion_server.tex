@@ -52,6 +52,16 @@
 
 \newcommand{\code}[1]{\texttt{#1}}
 
+% Callout box for gotchas / warnings.
+\newsavebox{\warnboxsave}
+\definecolor{warnbg}{RGB}{255,248,232}
+\definecolor{warnrule}{RGB}{205,145,20}
+\newenvironment{warnbox}%
+  {\par\medskip\begin{lrbox}{\warnboxsave}%
+   \begin{minipage}{\dimexpr\linewidth-2\fboxsep-2\fboxrule\relax}}%
+  {\end{minipage}\end{lrbox}%
+   \noindent\fcolorbox{warnrule}{warnbg}{\usebox{\warnboxsave}}\par\medskip}
+
 % ---------------------------------------------------------------------------
 %  Title
 % ---------------------------------------------------------------------------
@@ -231,6 +241,91 @@ Server port     & \code{8000}           & Web address is \code{localhost:8000} \
 \caption{System configuration.}
 \label{tab:config}
 \end{table}
+
+% ===========================================================================
+\section{ROS 2 Topics and Interfaces Reference}
+\label{sec:topics}
+% ===========================================================================
+Section~\ref{sec:domain} introduced topics as ``radio channels.'' This section
+is the complete reference for the channels this robot actually broadcasts.
+
+A point that confuses newcomers: \emph{topics are not defined in configuration
+files.} There is no file you can open that lists them. A topic springs into
+existence when a running node asks for it in code --- for example, the camera
+node creates its channel with the single line
+
+\begin{lstlisting}[language=Python]
+self.publisher_ = self.create_publisher(CompressedImage, '/image/compressed', 1)
+\end{lstlisting}
+
+\noindent
+(see \code{robot/.../image\_publisher.py}, line 38). So the authoritative list
+of topics comes from asking the \emph{live} robot, not from reading a file.
+Table~\ref{tab:topics} is exactly that: the output of \code{ros2 topic list} on
+a running system, with each type resolved.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Topic} & \textbf{Message type} & \textbf{Published by} \\
+\midrule
+\code{/cmd\_vel}          & \code{geometry\_msgs/msg/Twist}        & \textbf{this app} (laptop $\to$ robot) \\
+\code{/image/compressed}  & \code{sensor\_msgs/msg/CompressedImage}& \code{image\_publisher} (custom) \\
+\code{/odom}              & \code{nav\_msgs/msg/Odometry}          & \code{diff\_drive\_controller} \\
+\code{/scan}              & \code{sensor\_msgs/msg/LaserScan}      & \code{hlds\_laser\_publisher} \\
+\code{/imu}               & \code{sensor\_msgs/msg/Imu}            & \code{turtlebot3\_node} \\
+\code{/magnetic\_field}   & \code{sensor\_msgs/msg/MagneticField}  & \code{turtlebot3\_node} \\
+\code{/battery\_state}    & \code{sensor\_msgs/msg/BatteryState}   & \code{turtlebot3\_node} \\
+\code{/joint\_states}     & \code{sensor\_msgs/msg/JointState}     & \code{turtlebot3\_node} \\
+\code{/sensor\_state}     & \code{turtlebot3\_msgs/msg/SensorState}& \code{turtlebot3\_node} \\
+\code{/tf}, \code{/tf\_static} & \code{tf2\_msgs/msg/TFMessage}    & \code{robot\_state\_publisher} \\
+\code{/robot\_description}& \code{std\_msgs/msg/String}            & \code{robot\_state\_publisher} \\
+\bottomrule
+\end{tabular}
+\caption{Every topic on the running system (\code{ROS\_DOMAIN\_ID=203}).}
+\label{tab:topics}
+\end{table}
+
+Of these eleven, the motion server touches exactly \textbf{two}: it subscribes
+to \code{/image/compressed} and publishes to \code{/cmd\_vel}. Everything else
+comes free with the standard bringup and is there if you want to extend the
+project --- \code{/scan} for obstacle avoidance, \code{/odom} for tracking
+where the robot has driven, \code{/battery\_state} for a charge warning.
+
+\subsection{Topics versus services}
+A \textbf{topic} is one-way broadcast: the sender publishes and never learns who
+listened. A \textbf{service} is a two-way request/response, like a phone call ---
+you ask a question and wait for an answer.
+
+Services \emph{are} defined in files, which is why the distinction matters here.
+The robot package contains one, \code{srv/Motion.srv}, which declares a request
+of two floats and a response of a success flag plus a message. It belongs to
+the upstream Jetson AI stack and \textbf{is not used by this app} --- the web
+GUI drives the robot purely by publishing \code{Twist} messages on
+\code{/cmd\_vel}.
+
+\subsection{Inspecting topics yourself}
+\begin{lstlisting}[language=bash]
+export ROS_DOMAIN_ID=203
+ros2 topic list              # every topic currently on the network
+ros2 topic type /cmd_vel     # what message type it carries
+ros2 topic echo /odom        # print messages as they arrive
+ros2 topic hz /scan          # measure how fast they arrive
+ros2 node list               # which programs are running
+\end{lstlisting}
+
+\begin{warnbox}
+If \code{ros2 topic list} shows only \code{/parameter\_events} and
+\code{/rosout}, it is almost always a \textbf{stale ROS daemon}, not a network
+fault --- and it will hide topics even on the robot itself. Fix it with
+\code{ros2 daemon stop}, or add \code{-{}-no-daemon} to the command. Note that
+\code{ros2 topic hz} does \emph{not} accept \code{-{}-no-daemon} on Humble: it
+exits with a usage error that looks deceptively like ``no data.'' Discovery
+also needs 20--30 seconds to fully settle after launch, so an incomplete list
+immediately after starting the robot is normal.
+\end{warnbox}
 
 % ===========================================================================
 \section{What Was Built: The Motion Server}
@@ -438,10 +533,25 @@ ttb-experiments/
   fastdds_unicast.xml       # optional fall-back for multicast-blocking networks
   .env.example              # configuration template (safe to share)
   .env                      # YOUR real config incl. password (git-ignored!)
+  robot/                    # reference snapshot of the ROBOT-side files
+    start_all.sh            #   launches bringup + camera on the robot
+    turtlebot3_image_motion/
+      turtlebot3_image_motion/image_publisher.py  # the camera node
+      srv/Motion.srv        #   a service definition (unused by this app)
+      package.xml / CMakeLists.txt
   docs/
     turtlebot3_motion_server.tex / .pdf   # this document
     images/gui.png
 \end{lstlisting}
+
+\paragraph{About \code{robot/}.} Those files run on the robot, not the laptop,
+and are copied here only so this repository documents the whole system. They are
+a snapshot of commit \code{54fb8a2} of a separate project,
+\url{https://github.com/SuperMadee/AI361-MEX3}, which remains the source of
+truth --- the robot builds from its own clone in \code{\textasciitilde/ros2\_ws},
+so editing the copies here changes nothing on the robot. Only the parts this
+project depends on were copied; the upstream package's Jetson-side AI stack
+(roughly 15{,}000 lines) is deliberately not duplicated.
 
 \paragraph{Security note.} The robot's SSH password and other real values live
 only in \code{.env}, which is listed in \code{.gitignore} and is therefore
