@@ -18,11 +18,14 @@ Open http://localhost:8000  (or http://<laptop-ip>:8000 from another device).
 """
 
 import argparse
+import json
 import socket
 import threading
 import time
+from typing import Literal, Optional
 
 import cv2
+import httpx
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -34,6 +37,12 @@ from cv_bridge import CvBridge
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+from pydantic import BaseModel
+
+
+def clamp(value, lo, hi):
+    """Constrain value to [lo, hi]. Every velocity and duration goes through this."""
+    return max(lo, min(hi, value))
 
 
 # --------------------------------------------------------------------------- #
@@ -167,14 +176,196 @@ class MotionNode(Node):
 
 
 # --------------------------------------------------------------------------- #
+# Natural-language command parsing (local LLM via ollama)
+# --------------------------------------------------------------------------- #
+ACTIONS = ("forward", "backward", "rotate_left", "rotate_right", "stop", "unknown")
+
+# Constrains the model's output at the decoder level, so it can only ever emit
+# one of these actions. Values are still re-validated and clamped below --- the
+# model is an intent parser, never a safety layer.
+NL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string", "enum": list(ACTIONS)},
+        "duration_s": {"type": "number"},
+        "speed": {"type": "string", "enum": ["slow", "normal", "fast"]},
+    },
+    "required": ["action", "duration_s", "speed"],
+}
+
+NL_SYSTEM_PROMPT = """\
+You control a TurtleBot3 robot. Convert the user's driving instruction into JSON.
+
+action: forward | backward | rotate_left | rotate_right | stop | unknown
+  Use 'unknown' ONLY if the text is not a driving instruction.
+duration_s: how many seconds to move. Default 2. Maximum {max_duration}.
+speed: slow | normal | fast. Default normal.
+
+Examples:
+  "move forward"            -> forward, 2, normal
+  "back up slowly"          -> backward, 2, slow
+  "rotate left 3 seconds"   -> rotate_left, 3, normal
+  "halt"                    -> stop, 0, normal
+"""
+
+
+class Intent(BaseModel):
+    """Validated result of a parse. Pydantic rejects anything off-enum."""
+    action: Literal["forward", "backward", "rotate_left",
+                    "rotate_right", "stop", "unknown"]
+    duration_s: float
+    speed: Literal["slow", "normal", "fast"] = "normal"
+
+
+class NLRequest(BaseModel):
+    """Body of POST /nl."""
+    text: str = ""
+
+
+class NLParser:
+    """Turns free text into an Intent using a local ollama model."""
+
+    def __init__(self, url, model, max_duration, timeout=30.0):
+        self.url = url.rstrip("/")
+        self.model = model
+        self.max_duration = max_duration
+        self._client = httpx.Client(timeout=timeout)
+        self._system = NL_SYSTEM_PROMPT.format(max_duration=max_duration)
+
+    def parse(self, text):
+        """Return (Intent, None) on success or (None, error_message) on failure."""
+        body = {
+            "model": self.model,
+            "stream": False,
+            "keep_alive": "10m",          # avoid a ~16 s cold reload per command
+            "options": {"temperature": 0},
+            "format": NL_SCHEMA,
+            "messages": [
+                {"role": "system", "content": self._system},
+                {"role": "user", "content": text},
+            ],
+        }
+        try:
+            r = self._client.post(f"{self.url}/api/chat", json=body)
+            r.raise_for_status()
+            return Intent(**json.loads(r.json()["message"]["content"])), None
+        except httpx.HTTPError as e:
+            return None, f"cannot reach the language model at {self.url} ({type(e).__name__})"
+        except Exception as e:  # noqa: BLE001 - malformed/unparseable model output
+            return None, f"the language model returned something unusable ({type(e).__name__})"
+
+
+class MotionExecutor:
+    """Runs one bounded, cancellable motion at a time.
+
+    A natural-language command is a single discrete instruction, but the node's
+    0.4 s deadman (see MotionNode._publish_cmd) stops the robot unless commands
+    keep arriving. So this re-asserts the target velocity every 0.1 s for the
+    requested duration, then stops. The deadman stays in place underneath as the
+    backstop: if this thread dies, the robot halts within 0.4 s.
+    """
+
+    SPEED_FRAC = {"slow": 0.4, "normal": 0.7, "fast": 1.0}
+
+    def __init__(self, node: MotionNode, max_lin, max_ang, max_duration):
+        self._node = node
+        self._max_lin = max_lin
+        self._max_ang = max_ang
+        self._max_duration = max_duration
+        self._lock = threading.Lock()
+        self._thread = None
+        self._run_state = None
+        self._active = None
+        self._ends_at = 0.0
+
+    # --- lifecycle -------------------------------------------------------- #
+    def _abort(self, stop_on_exit):
+        """Cancel any running motion and wait briefly for the thread to exit."""
+        with self._lock:
+            state, thread = self._run_state, self._thread
+        if state is not None:
+            state["stop_on_exit"] = stop_on_exit
+            state["cancel"].set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=0.5)
+
+    def cancel(self, stop=True):
+        """Abort the current motion. stop=False when the caller is about to
+        issue its own velocity (manual teleop preempting a typed command)."""
+        self._abort(stop_on_exit=stop)
+        if stop:
+            self._node.stop()
+
+    def start(self, action, duration_s, speed):
+        """Begin a motion. Returns (duration, lin, ang) after clamping."""
+        duration = clamp(float(duration_s), 0.0, self._max_duration)
+        frac = self.SPEED_FRAC.get(speed, 0.7)
+
+        lin = ang = 0.0
+        if action == "forward":
+            lin = self._max_lin * frac
+        elif action == "backward":
+            lin = -self._max_lin * frac
+        elif action == "rotate_left":
+            ang = self._max_ang * frac
+        elif action == "rotate_right":
+            ang = -self._max_ang * frac
+        lin = clamp(lin, -self._max_lin, self._max_lin)
+        ang = clamp(ang, -self._max_ang, self._max_ang)
+
+        # Replace any in-flight motion; don't stop, we're about to drive.
+        self._abort(stop_on_exit=False)
+
+        state = {"cancel": threading.Event(), "stop_on_exit": True}
+        thread = threading.Thread(target=self._run, args=(state, lin, ang, duration),
+                                  daemon=True)
+        with self._lock:
+            self._run_state = state
+            self._thread = thread
+            self._active = {"action": action, "duration_s": duration,
+                            "speed": speed, "lin": round(lin, 3),
+                            "ang": round(ang, 3)}
+            self._ends_at = time.time() + duration
+        thread.start()
+        return duration, lin, ang
+
+    def _run(self, state, lin, ang, duration):
+        end = time.time() + duration
+        try:
+            while not state["cancel"].is_set() and time.time() < end:
+                self._node.set_velocity(lin, ang)
+                state["cancel"].wait(0.1)   # returns immediately once cancelled
+        finally:
+            if state["stop_on_exit"]:
+                self._node.stop()
+            with self._lock:
+                if self._run_state is state:
+                    self._run_state = None
+                    self._thread = None
+                    self._active = None
+
+    def status(self):
+        with self._lock:
+            active = dict(self._active) if self._active else None
+            ends_at = self._ends_at
+        if active is not None:
+            active["remaining_s"] = max(0.0, round(ends_at - time.time(), 1))
+        return {"running": active is not None, "motion": active}
+
+
+# --------------------------------------------------------------------------- #
 # Web server
 # --------------------------------------------------------------------------- #
-def build_app(node: MotionNode, max_lin, max_ang):
+def build_app(node: MotionNode, max_lin, max_ang,
+              parser: Optional[NLParser] = None, nl_max_duration=10.0,
+              link_check=False):
     app = FastAPI()
+    executor = MotionExecutor(node, max_lin, max_ang, nl_max_duration)
 
     @app.get("/", response_class=HTMLResponse)
     def index():
-        return HTML_PAGE
+        return HTML_PAGE.replace("__NL_ENABLED__",
+                                 "true" if parser is not None else "false")
 
     @app.get("/video")
     def video():
@@ -190,16 +381,82 @@ def build_app(node: MotionNode, max_lin, max_ang):
 
     @app.post("/cmd")
     def cmd(lin: float = 0.0, ang: float = 0.0):
-        # Clamp to configured maxima.
-        lin = max(-max_lin, min(max_lin, lin))
-        ang = max(-max_ang, min(max_ang, ang))
+        # Manual teleop always wins: drop any typed command still running.
+        # stop=False because we immediately set our own velocity below.
+        executor.cancel(stop=False)
+        lin = clamp(lin, -max_lin, max_lin)
+        ang = clamp(ang, -max_ang, max_ang)
         node.set_velocity(lin, ang)
         return JSONResponse({"lin": lin, "ang": ang})
 
     @app.post("/stop")
     def stop():
+        executor.cancel(stop=True)
         node.stop()
         return JSONResponse({"stopped": True})
+
+    @app.post("/nl")
+    def nl(req: NLRequest, dry_run: int = 0):
+        """Parse a plain-English instruction and (unless dry_run) execute it."""
+        if parser is None:
+            return JSONResponse(
+                {"executed": False, "action": "unknown",
+                 "message": "natural-language control is disabled "
+                            "(start the server with --enable-nl)"},
+                status_code=503)
+
+        text = (req.text or "").strip()
+        if not text:
+            return JSONResponse({"executed": False, "action": "unknown",
+                                 "message": "say something first"})
+
+        intent, error = parser.parse(text)
+        if error is not None:
+            return JSONResponse({"executed": False, "action": "unknown",
+                                 "message": error})
+
+        requested = intent.duration_s
+        duration = clamp(float(requested), 0.0, nl_max_duration)
+        capped = abs(duration - requested) > 1e-6
+
+        result = {"action": intent.action, "speed": intent.speed,
+                  "duration_s": duration, "requested_duration_s": requested,
+                  "capped": capped, "executed": False}
+
+        if intent.action == "unknown":
+            result["message"] = f'"{text}" is not a driving command I understand'
+            return JSONResponse(result)
+
+        if intent.action == "stop":
+            if not dry_run:
+                executor.cancel(stop=True)
+            result["executed"] = not dry_run
+            result["message"] = "stopping"
+            return JSONResponse(result)
+
+        # Refuse to drive blind when the robot link is known to be down.
+        if link_check and node.link_rtt_ms is None and not dry_run:
+            result["message"] = "robot link is down - not sending a motion command"
+            return JSONResponse(result)
+
+        if dry_run:
+            result["message"] = f"[dry run] {intent.action} for {duration:g}s ({intent.speed})"
+            return JSONResponse(result)
+
+        duration, lin, ang = executor.start(intent.action, duration, intent.speed)
+        result.update({"executed": True, "duration_s": duration,
+                       "lin": round(lin, 3), "ang": round(ang, 3)})
+        note = f" (capped from {requested:g}s)" if capped else ""
+        result["message"] = (f"{intent.action.replace('_', ' ')} for "
+                             f"{duration:g}s at {intent.speed} speed{note}")
+        return JSONResponse(result)
+
+    @app.get("/nl/status")
+    def nl_status():
+        return JSONResponse({"enabled": parser is not None,
+                             "model": parser.model if parser else None,
+                             "max_duration_s": nl_max_duration,
+                             **executor.status()})
 
     @app.get("/status")
     def status():
@@ -253,6 +510,25 @@ HTML_PAGE = """
   input[type=range] { width:55%; vertical-align:middle; }
   .hint { color:#888; font-size:13px; margin-top:14px; }
   #status { color:#6c6; font-size:13px; }
+  .nlwrap { margin-top:16px; border-top:1px solid #333; padding-top:12px;
+            text-align:left; }
+  .nlwrap h2 { font-size:14px; color:#9aa; margin:0 0 8px; font-weight:600; }
+  .nlrow { display:flex; gap:8px; }
+  #nltext { flex:1 1 auto; min-width:0; background:#2a2a2a; color:#eee;
+            border:1px solid #3a3a3a; border-radius:8px; padding:9px 11px;
+            font-size:14px; font-family:inherit; }
+  #nltext:focus { outline:none; border-color:#3d7eff; }
+  #nlsend { flex:0 0 auto; border:0; border-radius:8px; background:#3d7eff;
+            color:#fff; padding:9px 16px; font-size:14px; cursor:pointer; }
+  #nlsend:disabled { background:#33415e; color:#889; cursor:default; }
+  #nllog { margin-top:10px; max-height:150px; overflow-y:auto; font-size:13px;
+           line-height:1.45; }
+  #nllog div { margin:3px 0; }
+  #nllog .you { color:#eee; }
+  #nllog .you::before { content:"› "; color:#3d7eff; }
+  #nllog .ok { color:#6c6; padding-left:14px; }
+  #nllog .no { color:#d0745e; padding-left:14px; }
+  #nllog .pending { color:#888; padding-left:14px; font-style:italic; }
 </style>
 </head>
 <body>
@@ -289,6 +565,16 @@ HTML_PAGE = """
     <p class="hint">Drive with the buttons above (press &amp; hold), or the keyboard:
        <b>W/A/S/D</b> or arrow keys · <b>Space</b> or <b>X</b> to stop.
        The robot stops the moment you release.</p>
+
+    <div class="nlwrap" id="nlwrap" style="display:none">
+      <h2>Say it in plain English</h2>
+      <div class="nlrow">
+        <input id="nltext" type="text" autocomplete="off"
+               placeholder="e.g. move forward for 3 seconds"/>
+        <button id="nlsend">Send</button>
+      </div>
+      <div id="nllog"></div>
+    </div>
    </div>
   </div>
 
@@ -337,13 +623,20 @@ function apply() {
   refreshBtns();
 }
 const keymap = {arrowup:'w', arrowdown:'s', arrowleft:'a', arrowright:'d'};
+// Ignore keys typed into a field, or typing "forward" would drive the robot.
+function typing(e) {
+  const t = e.target;
+  return t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA');
+}
 window.addEventListener('keydown', e => {
+  if (typing(e)) return;
   let k = e.key.toLowerCase(); k = keymap[k] || k;
   if (k === 'x' || k === ' ') { e.preventDefault(); held.clear(); apply(); return; }
   if ('wasd'.includes(k)) { e.preventDefault();
     if (!held.has(k)) { held.add(k); apply(); } }
 });
 window.addEventListener('keyup', e => {
+  if (typing(e)) return;
   let k = e.key.toLowerCase(); k = keymap[k] || k;
   if (held.has(k)) { held.delete(k); apply(); }
 });
@@ -368,6 +661,47 @@ document.querySelectorAll('button.k').forEach(b => {
   b.addEventListener('touchcancel', up, {passive:false});
 });
 
+// ---- natural-language control -------------------------------------------- //
+const NL_ENABLED = __NL_ENABLED__;
+const nlText = document.getElementById('nltext');
+const nlSend = document.getElementById('nlsend');
+const nlLog  = document.getElementById('nllog');
+if (NL_ENABLED) document.getElementById('nlwrap').style.display = '';
+
+function logLine(cls, text) {
+  const d = document.createElement('div');
+  d.className = cls; d.textContent = text;
+  nlLog.appendChild(d); nlLog.scrollTop = nlLog.scrollHeight;
+  return d;
+}
+async function sendNL() {
+  const t = nlText.value.trim();
+  if (!t) return;
+  logLine('you', t);
+  nlText.value = '';
+  nlSend.disabled = true;
+  const pending = logLine('pending', 'thinking…');
+  try {
+    const r = await fetch('/nl', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({text:t})});
+    const d = await r.json();
+    pending.remove();
+    logLine(d.executed ? 'ok' : 'no', d.message || 'no response');
+  } catch (e) {
+    pending.remove();
+    logLine('no', 'server unreachable');
+  } finally {
+    nlSend.disabled = false;
+    nlText.focus();
+  }
+}
+if (NL_ENABLED) {
+  nlSend.addEventListener('click', sendNL);
+  nlText.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); sendNL(); }
+  });
+}
+
 async function poll() {
   try {
     const r = await fetch('/status'); const s = await r.json();
@@ -386,6 +720,14 @@ async function poll() {
     }
   } catch(e) {
     document.getElementById('status').textContent = 'server unreachable';
+  }
+  if (NL_ENABLED) {
+    try {
+      const m = (await (await fetch('/nl/status')).json()).motion;
+      if (m) velEl.textContent =
+        `${m.action.replace('_',' ')} · ${m.remaining_s.toFixed(1)}s left ` +
+        `(v = ${m.lin.toFixed(2)}  ω = ${m.ang.toFixed(2)})`;
+    } catch(e) {}
   }
 }
 setInterval(poll, 1000); poll();
@@ -413,6 +755,14 @@ def main():
                     help="max linear speed (Burger=0.22, Waffle=0.26)")
     ap.add_argument("--max-ang", type=float, default=1.82,
                     help="max angular speed (Burger=2.84, Waffle=1.82)")
+    ap.add_argument("--enable-nl", action="store_true",
+                    help="enable natural-language driving via a local LLM")
+    ap.add_argument("--llm-url", default="http://localhost:11434",
+                    help="ollama base URL")
+    ap.add_argument("--llm-model", default="qwen2.5:3b",
+                    help="ollama model used to parse commands")
+    ap.add_argument("--nl-max-duration", type=float, default=10.0,
+                    help="hard cap (seconds) on any single typed motion")
     args = ap.parse_args()
 
     rclpy.init()
@@ -423,7 +773,15 @@ def main():
         target=lambda: rclpy.spin(node), daemon=True)
     spin.start()
 
-    app = build_app(node, args.max_lin, args.max_ang)
+    parser = None
+    if args.enable_nl:
+        parser = NLParser(args.llm_url, args.llm_model, args.nl_max_duration)
+        print(f"  Natural language: {args.llm_model} via {args.llm_url} "
+              f"(max {args.nl_max_duration:g}s per command)")
+
+    app = build_app(node, args.max_lin, args.max_ang, parser=parser,
+                    nl_max_duration=args.nl_max_duration,
+                    link_check=bool(args.robot_ip))
     print(f"\n  Open the GUI at:  http://localhost:{args.port}\n")
     try:
         uvicorn.run(app, host=args.host, port=args.port, log_level="warning")

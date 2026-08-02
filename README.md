@@ -87,6 +87,63 @@ ros2 topic echo /odom            # watch messages live
 > `ros2 topic hz` does not accept `--no-daemon` on Humble. Discovery can also
 > take 20-30 s to settle after launch.
 
+## Natural-language control
+
+Instead of holding a key, you can **type what you want** into the box under the
+control panel:
+
+```
+move forward for 3 seconds
+back up slowly
+rotate left
+spin right for 5 sec
+halt
+```
+
+The text is parsed by a **local LLM** (ollama, default `qwen2.5:3b`) — nothing
+leaves your laptop. Enable it in `.env`:
+
+```bash
+ENABLE_NL=1
+LLM_URL=http://localhost:11434
+LLM_MODEL=qwen2.5:3b
+NL_MAX_DURATION=10
+```
+
+Requires `ollama serve` running with the model pulled (`ollama pull qwen2.5:3b`).
+
+### How it stays safe
+
+The LLM only **interprets** your words. It never touches the motors directly,
+and every value it produces is re-checked in code before anything moves:
+
+| Guard | Effect |
+|-------|--------|
+| Duration cap | Clamped to `NL_MAX_DURATION` (10 s). "Drive forward for 3 hours" becomes 10 s |
+| Speed clamp | Velocities clamped to `MAX_LIN` / `MAX_ANG`, same limits as the D-pad |
+| Fixed action list | Only forward, backward, rotate left/right, stop. Anything else is refused |
+| Auto-stop | Every motion ends by itself — there is no "drive forever" |
+| STOP wins | The STOP button, `Space` and `X` abort a typed motion instantly |
+| Manual override | Pressing W/A/S/D takes control away from a running command |
+| Deadman backstop | If the server dies mid-motion, the robot halts within 0.4 s |
+| LLM down | Falls back to a refusal — never to uncommanded motion |
+
+Expect **2–4 seconds** between pressing Enter and the robot moving; that's the
+model parsing your text locally.
+
+### Testing without moving the robot
+
+`?dry_run=1` parses and clamps but never sends a motion command:
+
+```bash
+curl -s -X POST 'http://localhost:8000/nl?dry_run=1' \
+     -H 'Content-Type: application/json' \
+     -d '{"text":"drive forward for 3 hours"}'
+# -> {"action":"forward","duration_s":10.0,"capped":true,...}
+```
+
+`GET /nl/status` reports whether a motion is running and how long is left.
+
 ## Security
 
 Real secrets (the robot SSH password) live in `.env`, which is **git-ignored**

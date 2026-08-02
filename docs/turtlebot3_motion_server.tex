@@ -384,6 +384,102 @@ of the network \textbf{round-trip time} plus fixed allowances for internal
 processing --- see Section~\ref{sec:latencymath} for the full explanation.
 
 % ===========================================================================
+\section{Natural-Language Control with a Local LLM}
+\label{sec:nl}
+% ===========================================================================
+Holding a key is precise but wordless. This section adds a second way to drive:
+typing an instruction in plain English --- \emph{``move forward for 3 seconds''},
+\emph{``back up slowly''}, \emph{``rotate left''} --- and having the robot carry
+it out. The language model runs \textbf{on the laptop}, so no text ever leaves
+the machine.
+
+\subsection{Why a typed command needs a timer}
+This is the crux of the design, and it follows directly from the dead-man's
+switch in Section~\ref{sec:deadman}. Holding a key works because the browser
+sends a fresh command on every press; the robot keeps moving only while those
+commands keep arriving, and stops 0.4\,s after they cease.
+
+A typed instruction is a \emph{single event}. Send it once and the robot lurches
+for 0.4\,s and dies. So a natural-language command is executed by a small
+background worker that re-asserts the requested velocity every 0.1\,s for the
+requested duration, then stops. It feeds the dead-man's switch deliberately,
+for a bounded window.
+
+Crucially, the dead-man's switch is left \emph{completely untouched} underneath.
+If that worker thread crashes, or the whole server is killed mid-motion, no more
+commands arrive and the robot halts within 0.4\,s anyway. The new feature sits
+on top of the existing safety net rather than replacing it.
+
+\subsection{The model only interprets; it never drives}
+The model's sole job is to turn a sentence into a small, fixed record:
+
+\begin{lstlisting}[style=py]
+{"action": "forward", "duration_s": 3, "speed": "normal"}
+\end{lstlisting}
+
+\noindent
+\code{action} is restricted to six values (\code{forward}, \code{backward},
+\code{rotate\_left}, \code{rotate\_right}, \code{stop}, \code{unknown}) by a JSON
+schema enforced during decoding, so the model physically cannot emit anything
+else. The result is then re-validated in Python and every number is clamped
+before it can reach a motor.
+
+That last step is not a formality. During development both candidate models were
+asked to \emph{``drive forward for 3 hours''}: one returned a duration of
+10\,800 seconds, the other 1\,800 seconds, and one of them classified it as a
+perfectly ordinary drive command. Table~\ref{tab:nlsafety} lists the guards that
+turn that into a harmless 10-second nudge.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Guard} & \textbf{Effect} \\
+\midrule
+Duration cap      & Clamped to \code{NL\_MAX\_DURATION} (default 10\,s) \\
+Speed clamp       & Velocities clamped to \code{MAX\_LIN} / \code{MAX\_ANG} \\
+Fixed action list & Anything outside the six actions is refused \\
+Auto-stop         & Every motion ends by itself; no ``drive forever'' \\
+STOP wins         & STOP, \textbf{Space} or \textbf{X} aborts a typed motion \\
+Manual override   & \textbf{W/A/S/D} takes control from a running command \\
+Dead-man backstop & Server dies mid-motion $\Rightarrow$ robot stops in 0.4\,s \\
+Model unreachable & Falls back to a refusal, never to motion \\
+\bottomrule
+\end{tabular}
+\caption{Safety guards on natural-language commands. All are enforced in code,
+not by asking the model nicely.}
+\label{tab:nlsafety}
+\end{table}
+
+\subsection{What it costs you}
+Parsing takes roughly \textbf{2--4 seconds} on an RTX 3060 with
+\code{qwen2.5:3b} --- the delay between pressing Enter and the robot moving. The
+first command after an idle period can take around 16 seconds while the model is
+loaded into memory; the server passes \code{keep\_alive} to ollama to avoid
+paying that repeatedly. For reflex-speed driving, keep using the keyboard; this
+is a different, more conversational way to work.
+
+\subsection{Trying it without moving the robot}
+The \code{/nl} endpoint accepts \code{?dry\_run=1}, which parses and clamps the
+instruction and reports what \emph{would} happen, without sending any motion
+command. This is the safe way to check the model's understanding:
+
+\begin{lstlisting}[style=bash]
+curl -s -X POST 'http://localhost:8000/nl?dry_run=1' \
+     -H 'Content-Type: application/json' \
+     -d '{"text":"drive forward for 3 hours"}'
+# -> {"action":"forward","duration_s":10.0,"capped":true, ...}
+\end{lstlisting}
+
+\begin{warnbox}
+Natural language is a convenience layer, not an autonomy layer. The robot has no
+idea what is in front of it --- there is no obstacle avoidance on this path. It
+will happily drive into a wall if you ask it to. Keep watching the robot, keep a
+hand near STOP, and test with the wheels off the ground first.
+\end{warnbox}
+
+% ===========================================================================
 \section{Problems Encountered and How They Were Solved}
 \label{sec:fixes}
 % ===========================================================================
@@ -583,6 +679,10 @@ automated bots scan GitHub for leaked credentials within minutes.
 \code{MAX\_LIN}         & Max linear speed (m/s). \\
 \code{MAX\_ANG}         & Max angular speed (rad/s). \\
 \code{SERVER\_PORT}     & Web server port. \\
+\code{ENABLE\_NL}       & \code{1} to enable natural-language driving (Sec.~\ref{sec:nl}). \\
+\code{LLM\_URL}         & ollama base URL (default \code{http://localhost:11434}). \\
+\code{LLM\_MODEL}       & Model used to parse commands (\code{qwen2.5:3b}). \\
+\code{NL\_MAX\_DURATION}& Hard cap in seconds on any single typed motion. \\
 \bottomrule
 \end{tabular}
 \end{table}
