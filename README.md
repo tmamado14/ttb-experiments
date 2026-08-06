@@ -46,15 +46,15 @@ messages. Topics are *not* declared in config files; a node creates one in code
 and it appears on the network. Everything below is live when the robot is up
 (`ROS_DOMAIN_ID=203`).
 
-This app uses only two of them: it **reads** `/image/compressed` and **writes**
-`/cmd_vel`. The rest are published by the standard bringup and are available if
-you want to extend things.
+This app uses three of them: it **reads** `/image/compressed` and `/odom`, and
+**writes** `/cmd_vel`. The rest are published by the standard bringup and are
+available if you want to extend things.
 
 | Topic | Message type | Direction | Published by |
 |-------|--------------|-----------|--------------|
 | `/cmd_vel` | `geometry_msgs/msg/Twist` | laptop → robot | **this app** (drives the motors) |
 | `/image/compressed` | `sensor_msgs/msg/CompressedImage` | robot → laptop | `image_publisher` (custom, see `robot/`) |
-| `/odom` | `nav_msgs/msg/Odometry` | robot → laptop | `diff_drive_controller` |
+| `/odom` | `nav_msgs/msg/Odometry` | robot → laptop | **`diff_drive_controller`** (this app reads it to measure distance and angle) |
 | `/scan` | `sensor_msgs/msg/LaserScan` | robot → laptop | `hlds_laser_publisher` (LDS-01 lidar) |
 | `/imu` | `sensor_msgs/msg/Imu` | robot → laptop | `turtlebot3_node` |
 | `/magnetic_field` | `sensor_msgs/msg/MagneticField` | robot → laptop | `turtlebot3_node` |
@@ -90,14 +90,24 @@ ros2 topic echo /odom            # watch messages live
 ## Natural-language control
 
 Instead of holding a key, you can **type what you want** into the box under the
-control panel:
+control panel. You can say how *long* to move, how *far*, or how far to *turn*:
 
 ```
-move forward for 3 seconds
-back up slowly
-rotate left
-spin right for 5 sec
+move forward for 3 seconds      back up slowly
+move forward 1 meter            go forward a meter and a half
+back up 50 cm                   drive forward 2 feet
+rotate right 30 degrees         turn left 90 deg fast
+spin right a quarter turn       turn around
 halt
+```
+
+You can also **chain steps with commas** (or `then`, or `;`). Each one starts
+only after the previous has finished:
+
+```
+move forward 0.5 m, turn right 90 degrees, move forward 0.3 m
+go forward 1 meter then turn left 90 degrees
+forward 1 m, right 90, forward 1 m, right 90
 ```
 
 The text is parsed by a **local LLM** (ollama, default `qwen2.5:3b`) — nothing
@@ -107,10 +117,37 @@ leaves your laptop. Enable it in `.env`:
 ENABLE_NL=1
 LLM_URL=http://localhost:11434
 LLM_MODEL=qwen2.5:3b
-NL_MAX_DURATION=10
+NL_MAX_DURATION=10              # seconds  } per step
+NL_MAX_DISTANCE=2.0             # meters   }
+NL_MAX_ANGLE=360                # degrees  }
+NL_MAX_STEPS=5                  # steps         } per sequence
+NL_MAX_CHAIN_DISTANCE=3.0       # meters total  }
+NL_MAX_CHAIN_ANGLE=720          # degrees total }
+NL_MAX_CHAIN_SECONDS=120        # worst case    }
 ```
 
 Requires `ollama serve` running with the model pulled (`ollama pull qwen2.5:3b`).
+
+### Distance and angle are measured, not timed
+
+A time-based command is open-loop: it drives for N seconds and hopes. A
+**distance or angle command is closed-loop** — the server subscribes to `/odom`
+and watches how far the robot has actually gone, easing off as it approaches the
+goal and stopping when it arrives. Battery level, floor surface and motor
+deadband stop mattering, because nothing is being guessed from a stopwatch.
+
+Two consequences worth knowing:
+
+- **Distance and angle commands need `/odom`.** If the robot's bringup isn't
+  running, they are *refused* with a message saying so. They never silently fall
+  back to "distance ÷ speed = time" — a guess presented as a measurement is
+  exactly how a robot surprises you. Time-based commands still work, since they
+  need no odometry.
+- **Expect ±2 cm and ±5°** on a hard floor. Carpet is worse. That figure is
+  measured against the robot's *own wheel odometry*, which itself drifts 1–3 %,
+  so it is not a guarantee about absolute heading — over a full 360° spin the
+  true heading can be off by several degrees even when odometry reports exactly
+  360.0.
 
 ### How it stays safe
 
@@ -120,13 +157,43 @@ and every value it produces is re-checked in code before anything moves:
 | Guard | Effect |
 |-------|--------|
 | Duration cap | Clamped to `NL_MAX_DURATION` (10 s). "Drive forward for 3 hours" becomes 10 s |
+| Distance cap | Clamped to `NL_MAX_DISTANCE` (2 m). "Move forward 5 meters" becomes 2 m |
+| Angle cap | Clamped to `NL_MAX_ANGLE` (360°). "Rotate 1000 degrees" becomes 360° |
+| Chain budget | A sequence is **refused** (not trimmed) if it exceeds 5 steps, 3 m of path, 720°, or 120 s worst case. The caps above are per *step*, so without this three 2 m legs would pass every check and drive 6 m |
+| Chain aborts on failure | If any step ends for any reason other than reaching its goal, the remaining steps are abandoned — a turn that stopped short would leave every later step pointing the wrong way |
+| Mid-sequence stop | Refused. "forward 1 m, halt, turn left" is ambiguous, and truncating after the robot already moved is the failure that validating everything up front exists to prevent |
 | Speed clamp | Velocities clamped to `MAX_LIN` / `MAX_ANG`, same limits as the D-pad |
 | Fixed action list | Only forward, backward, rotate left/right, stop. Anything else is refused |
-| Auto-stop | Every motion ends by itself — there is no "drive forever" |
+| Auto-stop | Every motion ends by itself — there is no "drive forever" (see below) |
+| Goal timeout | A distance/angle goal also carries a wall-clock deadline (≈3× the ideal time + 2 s, ceiling `GOAL_TIMEOUT_MAX`). Slipping wheels can't turn "1 meter" into forever |
+| Progress watchdog | Less than 2 mm or 1° of progress for 1.5 s aborts the motion. Blocked wheels stop it in under 2 s rather than waiting out the timeout |
+| Odometry watchdog | If `/odom` goes quiet for 0.5 s mid-motion, the robot stops |
+| No odometry | Distance/angle commands are refused outright, never estimated open-loop |
 | STOP wins | The STOP button, `Space` and `X` abort a typed motion instantly |
 | Manual override | Pressing W/A/S/D takes control away from a running command |
 | Deadman backstop | If the server dies mid-motion, the robot halts within 0.4 s |
 | LLM down | Falls back to a refusal — never to uncommanded motion |
+
+A closed-loop goal is the one thing that could break the "auto-stop" promise: a
+motion that stops when the robot *arrives* will never stop if the robot can't
+get there. That's why a distance or angle command carries three independent
+endings — reaching the goal, the progress watchdog, and the timeout — with the
+0.4 s deadman underneath all of them.
+
+> **One gap, stated plainly:** none of this catches a robot that has been
+> **picked up**. TurtleBot3 odometry comes from wheel encoders, so wheels
+> spinning in the air report perfect progress, and a lifted robot will happily
+> "complete" a 1 metre move. The watchdogs catch *blocked* and *odometry-dead*,
+> not *airborne*. (This is also what makes testing on blocks so convenient.)
+
+> **Chaining is sequential convenience, not a path-accurate trajectory.**
+> Each step is measured from where the robot *thinks* it is when that step
+> begins, so errors compound. A 5° heading error left over from step 2 rotates
+> the whole of step 3's displacement — on a 0.3 m leg that lands you ~2.6 cm to
+> the side, and it grows with the length of the chain. Four 90° turns will not
+> reliably close a square. If you need a path the robot actually follows, you
+> need a navigation stack with a map and a localiser; this is dead reckoning
+> with good manners.
 
 Expect **2–4 seconds** between pressing Enter and the robot moving; that's the
 model parsing your text locally.
@@ -139,10 +206,52 @@ model parsing your text locally.
 curl -s -X POST 'http://localhost:8000/nl?dry_run=1' \
      -H 'Content-Type: application/json' \
      -d '{"text":"drive forward for 3 hours"}'
-# -> {"action":"forward","duration_s":10.0,"capped":true,...}
+# -> {"action":"forward","mode":"duration","value":10.0,"capped":true,...}
+
+curl -s -X POST 'http://localhost:8000/nl?dry_run=1' \
+     -H 'Content-Type: application/json' \
+     -d '{"text":"move forward 5 meters"}'
+# -> {"action":"forward","mode":"distance","value":2.0,"unit":"m","capped":true,...}
 ```
 
-`GET /nl/status` reports whether a motion is running and how long is left.
+Dry runs work with the robot switched off, so you can develop phrasings without
+it. A second server on a topic the robot doesn't subscribe to is also inert:
+
+```bash
+python3 motion_server.py --cmd-vel-topic /cmd_vel_test --port 8001 \
+        --image-topic /nonexistent --image-type raw --enable-nl
+```
+
+Nothing moves, but `/odom` is real — so every closed-loop goal ends in the
+progress watchdog, which is a direct test that the backstops fire.
+
+`GET /nl/status` reports whether a motion is running, how far it has got
+(`progress` / `goal` / `unit`), which step of a sequence it's on (`step` /
+`steps`), and `last_result` — why the previous motion ended (`done`,
+`cancelled`, `timed out`, `no progress`, `odometry stalled`) and **at which
+step**.
+
+A neat property of the dummy-topic instance: an **all-duration chain is
+open-loop, so it runs to completion with the robot stationary**. That gives a
+real end-to-end test of the sequencing — including that the settle pause between
+steps actually happens — without a wheel turning. Mix in one distance or angle
+step and you get a genuine mid-chain failure to check that the steps after it
+are abandoned.
+
+### Where a chained command can surprise you
+
+Clauses are split on punctuation before the model ever sees them, one clause per
+model call. That keeps failures attributable to a specific fragment, but it has
+two consequences worth knowing:
+
+- **A fragment with no movement word in it is treated as a qualifier and glued
+  to its neighbour.** That's what makes "move forward 1 m, slowly" work as one
+  command — but it also means "forward 1 m, banana, turn left" silently absorbs
+  the `banana` rather than complaining about it.
+- **Elliptical clauses don't carry context.** "forward 1 m, then the same again"
+  has no amount in step 2, so it falls back to the 2-second default; "turn right
+  90, then left" gives you a 2-second left turn, not a 90° one. Spell each step
+  out in full.
 
 ## Security
 

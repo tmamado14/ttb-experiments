@@ -273,7 +273,7 @@ a running system, with each type resolved.
 \midrule
 \code{/cmd\_vel}          & \code{geometry\_msgs/msg/Twist}        & \textbf{this app} (laptop $\to$ robot) \\
 \code{/image/compressed}  & \code{sensor\_msgs/msg/CompressedImage}& \code{image\_publisher} (custom) \\
-\code{/odom}              & \code{nav\_msgs/msg/Odometry}          & \code{diff\_drive\_controller} \\
+\code{/odom}              & \code{nav\_msgs/msg/Odometry}          & \code{diff\_drive\_controller} (read by \textbf{this app}) \\
 \code{/scan}              & \code{sensor\_msgs/msg/LaserScan}      & \code{hlds\_laser\_publisher} \\
 \code{/imu}               & \code{sensor\_msgs/msg/Imu}            & \code{turtlebot3\_node} \\
 \code{/magnetic\_field}   & \code{sensor\_msgs/msg/MagneticField}  & \code{turtlebot3\_node} \\
@@ -288,11 +288,12 @@ a running system, with each type resolved.
 \label{tab:topics}
 \end{table}
 
-Of these eleven, the motion server touches exactly \textbf{two}: it subscribes
-to \code{/image/compressed} and publishes to \code{/cmd\_vel}. Everything else
-comes free with the standard bringup and is there if you want to extend the
-project --- \code{/scan} for obstacle avoidance, \code{/odom} for tracking
-where the robot has driven, \code{/battery\_state} for a charge warning.
+Of these eleven, the motion server touches exactly \textbf{three}: it subscribes
+to \code{/image/compressed} for the video feed and to \code{/odom} to measure
+distance and angle goals (Section~\ref{sec:closedloop}), and publishes to
+\code{/cmd\_vel}. Everything else comes free with the standard bringup and is
+there if you want to extend the project --- \code{/scan} for obstacle avoidance,
+\code{/battery\_state} for a charge warning.
 
 \subsection{Topics versus services}
 A \textbf{topic} is one-way broadcast: the sender publishes and never learns who
@@ -389,9 +390,15 @@ processing --- see Section~\ref{sec:latencymath} for the full explanation.
 % ===========================================================================
 Holding a key is precise but wordless. This section adds a second way to drive:
 typing an instruction in plain English --- \emph{``move forward for 3 seconds''},
-\emph{``back up slowly''}, \emph{``rotate left''} --- and having the robot carry
-it out. The language model runs \textbf{on the laptop}, so no text ever leaves
-the machine.
+\emph{``move forward 1 meter''}, \emph{``rotate right 30 degrees''} --- and
+having the robot carry it out. The language model runs \textbf{on the laptop}, so
+no text ever leaves the machine.
+
+An instruction can specify how \emph{long} to move, how \emph{far} to move, or
+how far to \emph{turn}. The first is open-loop timing; the other two are
+closed-loop and measured against the robot's odometry, which is the subject of
+Section~\ref{sec:closedloop}. Several instructions can also be chained with
+commas and run one after another --- Section~\ref{sec:chaining}.
 
 \subsection{Why a typed command needs a timer}
 This is the crux of the design, and it follows directly from the dead-man's
@@ -414,7 +421,7 @@ on top of the existing safety net rather than replacing it.
 The model's sole job is to turn a sentence into a small, fixed record:
 
 \begin{lstlisting}[style=py]
-{"action": "forward", "duration_s": 3, "speed": "normal"}
+{"action": "forward", "mode": "distance", "value": 1, "speed": "normal"}
 \end{lstlisting}
 
 \noindent
@@ -423,6 +430,19 @@ The model's sole job is to turn a sentence into a small, fixed record:
 schema enforced during decoding, so the model physically cannot emit anything
 else. The result is then re-validated in Python and every number is clamped
 before it can reach a motor.
+
+\code{mode} tags what unit \code{value} carries: \code{duration} means seconds,
+\code{distance} means metres, \code{angle} means degrees. One tagged number is
+used rather than three separate optional fields, for a practical reason ---
+under schema-constrained decoding an ``optional'' field is a coin flip, so all
+three would end up mandatory, and a 3-billion-parameter model handed three
+mutually exclusive numbers will dutifully fill in all of them, inventing a
+duration for \emph{``move forward 1 meter''} purely because the slot exists.
+
+The order of the fields in the schema is also deliberate. Decoders emit
+properties in the order the schema lists them, so \code{mode} is placed
+\emph{before} \code{value}: the model commits to the unit before it writes the
+number. Reversed, it picks a number blind and then rationalises a unit for it.
 
 That last step is not a formality. During development both candidate models were
 asked to \emph{``drive forward for 3 hours''}: one returned a duration of
@@ -438,9 +458,18 @@ turn that into a harmless 10-second nudge.
 \textbf{Guard} & \textbf{Effect} \\
 \midrule
 Duration cap      & Clamped to \code{NL\_MAX\_DURATION} (default 10\,s) \\
+Distance cap      & Clamped to \code{NL\_MAX\_DISTANCE} (default 2\,m) \\
+Angle cap         & Clamped to \code{NL\_MAX\_ANGLE} (default 360\textdegree) \\
+Chain budget      & Sequence refused over 5 steps / 3\,m / 720\textdegree{} / 120\,s \\
+Chain aborts      & One failed step abandons every step after it \\
+Mid-chain stop    & Refused; a \code{stop} must stand on its own \\
 Speed clamp       & Velocities clamped to \code{MAX\_LIN} / \code{MAX\_ANG} \\
 Fixed action list & Anything outside the six actions is refused \\
 Auto-stop         & Every motion ends by itself; no ``drive forever'' \\
+Goal timeout      & Closed-loop goals also carry a wall-clock deadline \\
+Progress watchdog & $<$2\,mm or $<$1\textdegree{} for 1.5\,s aborts the motion \\
+Odometry watchdog & \code{/odom} silent for 0.5\,s $\Rightarrow$ stop \\
+No odometry       & Distance/angle refused outright, never estimated \\
 STOP wins         & STOP, \textbf{Space} or \textbf{X} aborts a typed motion \\
 Manual override   & \textbf{W/A/S/D} takes control from a running command \\
 Dead-man backstop & Server dies mid-motion $\Rightarrow$ robot stops in 0.4\,s \\
@@ -451,6 +480,180 @@ Model unreachable & Falls back to a refusal, never to motion \\
 not by asking the model nicely.}
 \label{tab:nlsafety}
 \end{table}
+
+\subsection{Distance and angle: measuring instead of guessing}
+\label{sec:closedloop}
+The speed sliders and a duration together imply a distance --- speed multiplied
+by time. It is tempting to stop there: to turn \emph{``move forward 1 meter''}
+into $1 \div 0.154 = 6.5$ seconds of driving and call it done. That is
+\emph{open-loop} control, and it is wrong in a way that cannot be tuned out. The
+robot accelerates rather than jumping to speed, the motors have a deadband, the
+wheels slip, and a tired battery turns slower than a fresh one. Errors of
+10--20\,\% are normal, and nothing in the loop ever notices.
+
+Instead the server subscribes to \code{/odom}, the odometry the robot already
+publishes 20 times a second, and \emph{measures}. For a distance goal it records
+the starting position and watches the straight-line displacement grow; for an
+angle goal it watches the heading. When the remaining error falls inside a
+tolerance band, it stops.
+
+\subsubsection{Easing into the goal}
+A na\"ive version --- drive at full speed until the goal is reached, then stop
+--- overshoots badly, and the reason is worth spelling out. Between the instant
+the robot is actually at the goal and the instant its wheels stop, the following
+must happen: the next odometry sample has to arrive (up to 50\,ms), cross the
+Wi-Fi (5--20\,ms), be noticed by the control loop (up to 50\,ms), be published on
+the next command tick (up to 50\,ms), cross back, and finally be acted on by the
+motors (30--80\,ms). That is roughly \textbf{150\,ms} of unavoidable lag. At
+normal speed the robot travels 2\,cm --- or turns \textbf{17\textdegree} --- in
+that time.
+
+The fix is to slow down before arriving. The commanded speed is scaled down
+proportionally over the last 10\,cm (or 25\textdegree), so by the time the stop
+decision is made the robot is already crawling, and 150\,ms of lag costs
+millimetres instead of centimetres.
+
+There is a floor under that ramp, and it matters: a TurtleBot3 below roughly
+0.01\,m/s simply buzzes without moving. The commanded speed is never allowed
+below about twice that. This produces a genuine tension --- a higher floor
+overshoots, a lower one stalls short of the goal and burns the timeout --- and it
+is the floor, not the tolerance, that ultimately bounds the error.
+
+\subsubsection{Turning past half a circle}
+Odometry reports heading as an angle between $-\pi$ and $+\pi$, which wraps.
+Subtracting a start heading from a current one na\"ively means a
+270\textdegree{} turn appears to fold back on itself and the goal is never
+reached --- the robot would spin until the timeout. So each incoming sample's
+\emph{change} in heading is unwrapped and accumulated into a running total that
+is free to pass $\pi$. At 20\,Hz the largest genuine change between samples is
+about 0.14\,rad, far from the $\pi$ boundary, so the correction is never
+ambiguous. A jump larger than 2\,rad is not a rotation at all but an odometry
+reset, and is flagged as such rather than silently corrupting the total.
+
+\subsubsection{Why this cannot mean ``drive forever''}
+Section~\ref{sec:deadman} promised that every motion ends by itself. A goal that
+stops when the robot \emph{arrives} threatens exactly that promise, because a
+robot that cannot arrive would never stop. Three independent endings are
+therefore in place: reaching the goal; a progress watchdog that aborts after
+1.5\,s of no measurable movement; and a wall-clock timeout of roughly three
+times the ideal duration plus a margin. The 0.4\,s dead-man's switch sits
+underneath all three.
+
+\begin{warnbox}
+None of these watchdogs catches a robot that has been \emph{picked up}.
+TurtleBot3 odometry comes from wheel encoders, so wheels spinning in the air
+report flawless progress and a lifted robot will cheerfully ``complete'' a
+1-metre move. The watchdogs catch \emph{blocked} and \emph{odometry-dead}, not
+\emph{airborne}. This is a real limitation --- and, conveniently, what makes
+testing on blocks so effective.
+\end{warnbox}
+
+\subsubsection{How accurate is it?}
+Expect about \textbf{$\pm$2\,cm and $\pm$5\textdegree} on a hard floor; carpet is
+worse. Note carefully what that is measured against: the robot's own wheel
+odometry, which itself drifts 1--3\,\% through slip. It is \emph{not} a claim
+about absolute heading. Over a full 360\textdegree{} spin, odometry may report
+exactly 360.0 while the true heading is several degrees off. Tuning the
+tolerances to compensate for slip would be a mistake --- that is a calibration
+problem, not a control problem.
+
+\subsection{Chaining several instructions}
+\label{sec:chaining}
+Commas (or \emph{then}, or semicolons) join instructions into a sequence, run
+strictly in order, each beginning only once the previous one has finished:
+
+\begin{lstlisting}[style=bash]
+move forward 0.5 m, turn right 90 degrees, move forward 0.3 m
+\end{lstlisting}
+
+\subsubsection{Splitting happens before the model, not inside it}
+The obvious approach --- ask the model for a \emph{list} of steps --- is the
+wrong one here. The text is split into clauses in Python and each clause is sent
+to the model on its own, for three reasons.
+
+The decisive one is that failures stay \textbf{attributable}. Holding the
+fragment lets the server say \emph{step 2 of 3 (``go to the kitchen''): not a
+driving command I understand}. Had the model chosen the decomposition, there
+would be no span of the user's own words to quote back at them.
+
+Second, the prompt and schema from the previous section are left untouched, so
+the single-instruction behaviour they were tested against is unchanged by
+construction rather than by hope. Third, under schema-constrained decoding the
+\emph{length} of an array is not reliably constrained, so a step limit would
+become a check applied after the fact to however many steps the model felt like
+emitting, instead of a property of the user's own punctuation.
+
+The splitter has one subtlety worth stating: a fragment containing no movement
+word is treated as a \emph{qualifier} and glued back onto its neighbour. This is
+what keeps \emph{``move forward 1 m, slowly''} a single instruction. Note also
+that a bare \emph{and} is deliberately not a separator --- \emph{``go forward a
+meter and a half''} must survive intact.
+
+\subsubsection{One thread, one cancel}
+The whole sequence runs on a single worker thread sharing a single cancellation
+flag. This is a safety property, not a tidiness one.
+
+The tempting alternative --- let each step, as it finishes, launch the next ---
+races the STOP path. Stopping works by raising the cancel flag and then waiting
+briefly for the worker to exit. If a dying worker spawns its successor, that
+wait can return with a \emph{brand new} motion already running, and the robot
+carries on. The STOP button would appear to do nothing. Keeping the whole
+sequence inside one cancellable worker means the existing STOP button, the
+keyboard, and a typed \emph{halt} all abort the entire sequence without any of
+them needing to know that sequences exist.
+
+\subsubsection{A failed step abandons the rest}
+If any step ends for any reason other than reaching its goal --- timeout,
+blocked wheels, odometry loss, the STOP button --- the remaining steps are
+discarded rather than attempted.
+
+This is the whole reason the feature needs care. Suppose \emph{``forward 0.5 m,
+turn right 90\textdegree, forward 0.3 m''} and the turn stops at 41\textdegree.
+Carrying on would drive the final leg 49\textdegree{} away from where it was
+meant to go --- confidently, and in a direction nobody asked for. A sequence is
+only meaningful while every step before it did what it said.
+
+\subsubsection{The pause between steps}
+Steps are separated by a deliberate 0.35\,s pause with zero velocity commanded
+explicitly. It is not there for braking --- the ramp of
+Section~\ref{sec:closedloop} hands off at the speed floor, so the robot is
+physically stopped in well under 50\,ms.
+
+It is there because the \emph{measurement} lags the robot. Odometry is the last
+sample \emph{received}, up to a 20\,Hz period plus wireless transport old. A step
+that snapshots its starting pose while the robot is still moving measures its
+goal from a position the robot has already left. The pause lets several fresh
+samples arrive after the robot is genuinely still. It is also kept below the
+0.4\,s dead-man's timeout, so a healthy sequence never relies on that backstop.
+
+\subsubsection{Budgets for the whole sequence}
+Every cap in Table~\ref{tab:nlsafety} was per \emph{motion}. Three steps of two
+metres each would clear all of them individually and drive six metres. A
+sequence therefore carries its own budget --- 5 steps, 3\,m of path, 720\textdegree,
+120\,s worst case --- and is \textbf{refused} rather than trimmed when it
+exceeds one.
+
+Refusing breaks symmetry with the per-step caps on purpose. A capped step has a
+repair the user can see in their own sentence (``capped from 5\,m''). Trimming a
+sequence to fit has no such reading: which step should lose out? The result
+would be a robot ending up somewhere the user could not have predicted from what
+they typed.
+
+Note the distance budget bounds \emph{path length}, not displacement:
+\emph{``forward 2 m, backward 2 m''} spends 4\,m of it and finishes where it
+started. For a room-sized safety argument, path length is the right thing to
+bound.
+
+\begin{warnbox}
+\textbf{Chaining is sequential convenience, not a path-accurate trajectory.}
+Each step measures from where the robot \emph{believes} it is when that step
+starts, so errors compound: a 5\textdegree{} heading error left over from one
+turn rotates the whole of the next leg's displacement, putting a 0.3\,m leg
+about 2.6\,cm off to the side, and it grows with the length of the sequence.
+Four 90\textdegree{} turns will not reliably close a square. A path the robot
+genuinely follows needs a map and a localiser; this is dead reckoning with good
+manners.
+\end{warnbox}
 
 \subsection{What it costs you}
 Parsing takes roughly \textbf{2--4 seconds} on an RTX 3060 with
@@ -468,9 +671,31 @@ command. This is the safe way to check the model's understanding:
 \begin{lstlisting}[style=bash]
 curl -s -X POST 'http://localhost:8000/nl?dry_run=1' \
      -H 'Content-Type: application/json' \
-     -d '{"text":"drive forward for 3 hours"}'
-# -> {"action":"forward","duration_s":10.0,"capped":true, ...}
+     -d '{"text":"move forward 5 meters"}'
+# -> {"action":"forward","mode":"distance","value":2.0,"capped":true, ...}
 \end{lstlisting}
+
+\noindent
+Dry runs work with the robot switched off entirely, so phrasings can be
+developed without it. A second server started on a command topic the robot does
+not subscribe to is inert in a different and useful way:
+
+\begin{lstlisting}[style=bash]
+python3 motion_server.py --cmd-vel-topic /cmd_vel_test --port 8001 \
+        --image-topic /nonexistent --image-type raw --enable-nl
+\end{lstlisting}
+
+\noindent
+Nothing moves, but \code{/odom} is real --- so every closed-loop goal ends in the
+progress watchdog. That is not a limitation of the test, it \emph{is} the test:
+it proves the backstops fire, and it times them.
+
+For chained commands this instance is more useful still. An all-duration
+sequence is open-loop, so it \emph{runs to completion} with the robot standing
+still --- a genuine end-to-end test of the sequencing, in which the total elapsed
+time also confirms that the pause between steps really happened. Mixing in a
+single distance or angle step then produces a real mid-sequence failure, which
+is how you check that the steps after it are abandoned rather than attempted.
 
 \begin{warnbox}
 Natural language is a convenience layer, not an autonomy layer. The robot has no
@@ -676,6 +901,7 @@ automated bots scan GitHub for leaked credentials within minutes.
 \code{IMAGE\_TOPIC}     & Topic the camera publishes on. \\
 \code{IMAGE\_TYPE}      & \code{compressed}, \code{raw}, or \code{auto}. \\
 \code{CMD\_VEL\_TOPIC}  & Topic drive commands are published on. \\
+\code{ODOM\_TOPIC}      & Odometry topic read to measure distance/angle goals. \\
 \code{MAX\_LIN}         & Max linear speed (m/s). \\
 \code{MAX\_ANG}         & Max angular speed (rad/s). \\
 \code{SERVER\_PORT}     & Web server port. \\
@@ -683,6 +909,13 @@ automated bots scan GitHub for leaked credentials within minutes.
 \code{LLM\_URL}         & ollama base URL (default \code{http://localhost:11434}). \\
 \code{LLM\_MODEL}       & Model used to parse commands (\code{qwen2.5:3b}). \\
 \code{NL\_MAX\_DURATION}& Hard cap in seconds on any single typed motion. \\
+\code{NL\_MAX\_DISTANCE}& Hard cap in metres on any single typed distance goal. \\
+\code{NL\_MAX\_ANGLE}   & Hard cap in degrees on any single typed angle goal. \\
+\code{GOAL\_TIMEOUT\_MAX}& Ceiling in seconds on a closed-loop goal's timeout. \\
+\code{NL\_MAX\_STEPS}   & Most steps allowed in one chained sequence. \\
+\code{NL\_MAX\_CHAIN\_DISTANCE}& Cap in metres on total path length per sequence. \\
+\code{NL\_MAX\_CHAIN\_ANGLE}& Cap in degrees on total rotation per sequence. \\
+\code{NL\_MAX\_CHAIN\_SECONDS}& Cap on a sequence's worst-case running time. \\
 \bottomrule
 \end{tabular}
 \end{table}

@@ -28,15 +28,23 @@ if [[ "${ENABLE_NL:-0}" == "1" ]]; then
   NL_ARGS=(--enable-nl
            --llm-url "${LLM_URL:-http://localhost:11434}"
            --llm-model "${LLM_MODEL:-qwen2.5:3b}"
-           --nl-max-duration "${NL_MAX_DURATION:-10}")
+           --nl-max-duration "${NL_MAX_DURATION:-10}"
+           --nl-max-distance "${NL_MAX_DISTANCE:-2.0}"
+           --nl-max-angle "${NL_MAX_ANGLE:-360}"
+           --nl-max-steps "${NL_MAX_STEPS:-5}"
+           --nl-max-chain-distance "${NL_MAX_CHAIN_DISTANCE:-3.0}"
+           --nl-max-chain-angle "${NL_MAX_CHAIN_ANGLE:-720}"
+           --nl-max-chain-seconds "${NL_MAX_CHAIN_SECONDS:-120}")
 fi
 
 exec python3 motion_server.py \
   --image-topic  "${IMAGE_TOPIC}" \
   --image-type   "${IMAGE_TYPE}" \
   --cmd-vel-topic "${CMD_VEL_TOPIC}" \
+  --odom-topic "${ODOM_TOPIC:-/odom}" \
   --max-lin "${MAX_LIN}" \
   --max-ang "${MAX_ANG}" \
   --robot-ip "${ROBOT_IP}" \
   --port "${SERVER_PORT}" \
-  "${NL_ARGS[@]}"
+  --goal-timeout-max "${GOAL_TIMEOUT_MAX:-60}" \
+  ${NL_ARGS[@]+"${NL_ARGS[@]}"}

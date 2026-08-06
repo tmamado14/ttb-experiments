@@ -19,6 +19,8 @@ Open http://localhost:8000  (or http://<laptop-ip>:8000 from another device).
 
 import argparse
 import json
+import math
+import re
 import socket
 import threading
 import time
@@ -31,6 +33,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Image, CompressedImage
 from cv_bridge import CvBridge
 
@@ -50,11 +53,12 @@ def clamp(value, lo, hi):
 # --------------------------------------------------------------------------- #
 class MotionNode(Node):
     def __init__(self, image_topic, cmd_vel_topic, image_type="auto",
-                 robot_ip=None, cmd_timeout=0.4):
+                 robot_ip=None, cmd_timeout=0.4, odom_topic="/odom"):
         super().__init__("motion_server")
         self.bridge = CvBridge()
         self.image_topic = image_topic
         self.cmd_vel_topic = cmd_vel_topic
+        self.odom_topic = odom_topic
         self.cmd_timeout = cmd_timeout
 
         # Live network round-trip to the robot (dominant part of teleop latency).
@@ -74,6 +78,17 @@ class MotionNode(Node):
         self._vel_lock = threading.Lock()
         self._target = Twist()
         self._last_cmd_time = time.time()
+
+        # Odometry: where the robot thinks it is. Closed-loop distance/angle
+        # goals measure progress from this instead of trusting a stopwatch.
+        self._odom_lock = threading.Lock()
+        self._odom = None          # (x, y, yaw_unwrapped)
+        self._odom_time = 0.0      # time.monotonic() when it arrived
+        self._yaw_raw = None       # previous atan2 yaw, for delta unwrapping
+        self._yaw_acc = 0.0        # continuous yaw, free to run past +/-pi
+        self.odom_received = 0
+        self.odom_broken = False   # set on a pose discontinuity (odom reset)
+        self._odom_dt = 0.0        # smoothed sample period, for the rate readout
 
         # Sensor data is usually best-effort; command output is reliable.
         sensor_qos = QoSProfile(
@@ -99,6 +114,13 @@ class MotionNode(Node):
             self.create_subscription(
                 Image, image_topic, self._raw_cb, sensor_qos)
             self.get_logger().info(f"Subscribed to {image_topic} (Image)")
+
+        # Odometry. A BEST_EFFORT subscriber is compatible with the robot's
+        # RELIABLE publisher, and it's what a control loop actually wants:
+        # over Wi-Fi, RELIABLE means retransmits, and a late-but-complete pose
+        # is worse than a fresh one. depth=1 keeps only the newest sample.
+        self.create_subscription(Odometry, odom_topic, self._odom_cb, sensor_qos)
+        self.get_logger().info(f"Subscribed to {odom_topic} (Odometry)")
 
         # Publish target velocity at 20 Hz; stop if no fresh command (deadman).
         self.create_timer(0.05, self._publish_cmd)
@@ -146,6 +168,77 @@ class MotionNode(Node):
         ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
         return buf.tobytes() if ok else None
 
+    # --- odometry --------------------------------------------------------- #
+    # Largest yaw jump between samples we'll believe. At 20 Hz a Burger turning
+    # flat out moves 2.84/20 = 0.14 rad per sample, and even after half a second
+    # of dropped samples (our staleness limit) only 1.4 rad. Anything past 2.0
+    # is the robot teleporting, not turning.
+    MAX_YAW_STEP = 2.0
+
+    def _odom_cb(self, msg):
+        p = msg.pose.pose.position
+        q = msg.pose.pose.orientation
+        siny = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        yaw = math.atan2(siny, cosy)          # (-pi, pi]
+
+        with self._odom_lock:
+            # Unwrap here, at the source, rather than in the control loop: the
+            # per-sample delta is tiny compared to pi, so the wrap correction is
+            # never ambiguous. That turns yaw into one continuous signal any
+            # consumer can snapshot and subtract from -- which is what lets a
+            # "rotate 540 degrees" goal keep counting past half a turn instead
+            # of folding back at pi and never converging.
+            if self._yaw_raw is not None:
+                d = yaw - self._yaw_raw
+                if d > math.pi:
+                    d -= 2.0 * math.pi
+                elif d < -math.pi:
+                    d += 2.0 * math.pi
+                if abs(d) > self.MAX_YAW_STEP:
+                    # An odom reset, not a rotation. Unwrapping it would quietly
+                    # corrupt the accumulator, so flag it and let the control
+                    # loop abort instead.
+                    self.odom_broken = True
+                else:
+                    self._yaw_acc += d
+            self._yaw_raw = yaw
+            self._odom = (p.x, p.y, self._yaw_acc)
+            now = time.monotonic()
+            if self._odom_time:
+                dt = now - self._odom_time
+                self._odom_dt = dt if not self._odom_dt else \
+                    0.9 * self._odom_dt + 0.1 * dt
+            self._odom_time = now
+            self.odom_received += 1
+
+    def odom_stats(self):
+        """(age_s | None, hz | None, count) for the /status readout.
+
+        Exposed so the decision to keep the executor single-threaded stays a
+        measured one: if odom age starts climbing, that's the signal to split
+        the camera decode off its callback group.
+        """
+        with self._odom_lock:
+            if self._odom is None:
+                return None, None, self.odom_received
+            age = time.monotonic() - self._odom_time
+            hz = round(1.0 / self._odom_dt, 1) if self._odom_dt > 0 else None
+            return age, hz, self.odom_received
+
+    def get_odom(self):
+        """(x, y, yaw_unwrapped, age_s), or None if odom has never arrived.
+
+        Age is measured against time.monotonic() on this laptop, deliberately
+        not the message header: the robot's clock isn't synced to ours, so a
+        header-based age would be wrong by however far the two clocks drift.
+        """
+        with self._odom_lock:
+            if self._odom is None:
+                return None
+            x, y, yaw = self._odom
+            return x, y, yaw, time.monotonic() - self._odom_time
+
     # --- teleop ----------------------------------------------------------- #
     def set_velocity(self, linear, angular):
         with self._vel_lock:
@@ -179,41 +272,153 @@ class MotionNode(Node):
 # Natural-language command parsing (local LLM via ollama)
 # --------------------------------------------------------------------------- #
 ACTIONS = ("forward", "backward", "rotate_left", "rotate_right", "stop", "unknown")
+MODES = ("duration", "distance", "angle")
+
+# Which modes make sense for which actions. You cannot drive forward by a number
+# of degrees, and you cannot rotate by a number of meters.
+LINEAR_ACTIONS = ("forward", "backward")
+ANGULAR_ACTIONS = ("rotate_left", "rotate_right")
+
+# Units each mode measures in, for messages and the GUI readout.
+MODE_UNIT = {"duration": "s", "distance": "m", "angle": "deg"}
+
+# --------------------------------------------------------------------------- #
+# Splitting a chained command into steps
+# --------------------------------------------------------------------------- #
+# A chain ("forward 0.5 m, turn right 90, forward 0.3 m") is split HERE, in
+# Python, rather than by asking the model for an array of steps. Three reasons:
+#
+#   1. Failures stay attributable. Holding the fragment lets us say
+#      'step 2 of 3 ("trun rihgt 90"): ...'. If the model chose the
+#      decomposition there would be no span of the user's text to quote back.
+#   2. The prompt and schema below stay byte-identical, so the single-command
+#      behaviour they were verified against is provably unchanged, not
+#      probably fine.
+#   3. Under constrained decoding, array length is effectively unbounded
+#      (maxItems support is inconsistent), which would make the step cap a
+#      post-hoc check on whatever the model felt like emitting instead of a
+#      property of the user's punctuation.
+_STEP_SEP = re.compile(
+    r"[;\n]"                                     # explicit separators
+    r"|,"                                        # comma
+    r"|\.(?=\s|$)"                               # sentence-final period. Safe
+                                                 # without a lookbehind: a
+                                                 # decimal point is never
+                                                 # followed by whitespace, so
+                                                 # "0.5" survives intact.
+    r"|\band\s+then\b|\bthen\b|\bafter\s+that\b|\bnext\b",
+    re.IGNORECASE)
+
+# Deliberately NOT a separator: a bare "and". "go forward a meter and a half"
+# is one of the few-shot examples below and parses correctly today; splitting
+# on "and" would turn it into ["go forward a meter", "a half"] and break it.
+# "and then" is a separator, "and" alone is not.
+_MOTION_WORDS = re.compile(
+    r"\b(forward|forwards|ahead|straight|backward|backwards|back|reverse|"
+    r"turn|rotate|spin|pivot|left|right|stop|halt|go|drive|move|around)\b",
+    re.IGNORECASE)
+
+
+def split_steps(text):
+    """Free text -> ordered list of single-clause step texts.
+
+    Returns [] for empty input and a one-element list when there is no
+    separator -- which is what keeps a plain single command on exactly the code
+    path it has always been on.
+    """
+    parts = [p.strip(" \t,.;") for p in _STEP_SEP.split(text or "")]
+    parts = [p for p in parts if p]
+    if not parts:
+        return []
+
+    # A fragment with no motion word in it isn't a step, it's a qualifier that
+    # belongs to its neighbour. Without this, "move forward 1 m, slowly" becomes
+    # a two-step chain whose second step is "slowly", parses as unknown, and
+    # gets the whole chain refused -- a regression on a phrase that works today.
+    if len(parts) > 1 and not _MOTION_WORDS.search(parts[0]):
+        parts[1] = parts[0] + ", " + parts[1]     # leading qualifier
+        parts = parts[1:]
+    steps = [parts[0]]
+    for p in parts[1:]:
+        if _MOTION_WORDS.search(p):
+            steps.append(p)
+        else:
+            steps[-1] += ", " + p                 # trailing qualifier
+    return steps
 
 # Constrains the model's output at the decoder level, so it can only ever emit
 # one of these actions. Values are still re-validated and clamped below --- the
 # model is an intent parser, never a safety layer.
+#
+# One tagged number ("mode" says what unit "value" is in) rather than separate
+# optional distance_m/angle_deg fields. Under constrained decoding an optional
+# property is a coin flip, so all three would end up required --- and a 3B model
+# handed three mutually exclusive numbers will dutifully fill in all three,
+# inventing a duration for "move forward 1 meter" purely because the slot exists.
+#
+# Property order is load-bearing: the decoder emits properties in the order
+# listed, so putting "mode" before "value" makes the model commit to the unit
+# before it writes the number. Reversed, it picks a number blind and then
+# rationalises a unit for it.
 NL_SCHEMA = {
     "type": "object",
     "properties": {
         "action": {"type": "string", "enum": list(ACTIONS)},
-        "duration_s": {"type": "number"},
+        "mode": {"type": "string", "enum": list(MODES)},
+        "value": {"type": "number"},
         "speed": {"type": "string", "enum": ["slow", "normal", "fast"]},
     },
-    "required": ["action", "duration_s", "speed"],
+    "required": ["action", "mode", "value", "speed"],
 }
 
+# Degrees rather than radians, and meters rather than centimeters, because those
+# are the units the model has actually seen in this context. Asking a 3B model
+# for 1.5708 invites failure; math.radians() on our side cannot fail.
 NL_SYSTEM_PROMPT = """\
 You control a TurtleBot3 robot. Convert the user's driving instruction into JSON.
 
 action: forward | backward | rotate_left | rotate_right | stop | unknown
   Use 'unknown' ONLY if the text is not a driving instruction.
-duration_s: how many seconds to move. Default 2. Maximum {max_duration}.
+mode: how the amount is measured.
+  duration - the user gave a time      -> value is SECONDS (max {max_duration})
+  distance - the user gave a length    -> value is METERS  (max {max_distance})
+  angle    - the user gave a turn size -> value is DEGREES (max {max_angle})
+  If the user gave no amount at all, use duration with value 2.
+value: one number, in the unit chosen by mode. Convert to that unit yourself:
+  centimeters/cm -> meters (50 cm = 0.5), feet -> meters (1 ft = 0.3),
+  "a half" = 0.5, a quarter turn = 90, a half turn = 180, a full turn = 360.
+mode must match the action: forward and backward take duration or distance,
+never angle. rotate_left and rotate_right take duration or angle, never distance.
 speed: slow | normal | fast. Default normal.
 
 Examples:
-  "move forward"            -> forward, 2, normal
-  "back up slowly"          -> backward, 2, slow
-  "rotate left 3 seconds"   -> rotate_left, 3, normal
-  "halt"                    -> stop, 0, normal
+  "move forward"                  -> forward, duration, 2, normal
+  "back up slowly"                -> backward, duration, 2, slow
+  "rotate left 3 seconds"         -> rotate_left, duration, 3, normal
+  "move forward 1 meter"          -> forward, distance, 1, normal
+  "go forward a meter and a half" -> forward, distance, 1.5, normal
+  "back up 50 cm"                 -> backward, distance, 0.5, normal
+  "drive forward 2 feet"          -> forward, distance, 0.6, normal
+  "rotate right 30 degrees"       -> rotate_right, angle, 30, normal
+  "turn left 90 deg fast"         -> rotate_left, angle, 90, fast
+  "spin right a quarter turn"     -> rotate_right, angle, 90, normal
+  "turn around"                   -> rotate_left, angle, 180, normal
+  "halt"                          -> stop, duration, 0, normal
 """
 
 
 class Intent(BaseModel):
-    """Validated result of a parse. Pydantic rejects anything off-enum."""
+    """Validated result of a parse. Pydantic rejects anything off-enum.
+
+    Types and enums only. Whether the mode makes sense for the action is checked
+    in /nl, not here: a validator raising at this point would surface as "the
+    language model returned something unusable", which is a baffling thing to
+    tell someone who typed a perfectly clear sentence the model merely mis-tagged.
+    """
     action: Literal["forward", "backward", "rotate_left",
                     "rotate_right", "stop", "unknown"]
-    duration_s: float
+    mode: Literal["duration", "distance", "angle"] = "duration"
+    value: float = 0.0
     speed: Literal["slow", "normal", "fast"] = "normal"
 
 
@@ -225,12 +430,17 @@ class NLRequest(BaseModel):
 class NLParser:
     """Turns free text into an Intent using a local ollama model."""
 
-    def __init__(self, url, model, max_duration, timeout=30.0):
+    def __init__(self, url, model, max_duration, max_distance, max_angle,
+                 timeout=30.0):
         self.url = url.rstrip("/")
         self.model = model
         self.max_duration = max_duration
+        self.max_distance = max_distance
+        self.max_angle = max_angle
         self._client = httpx.Client(timeout=timeout)
-        self._system = NL_SYSTEM_PROMPT.format(max_duration=max_duration)
+        self._system = NL_SYSTEM_PROMPT.format(max_duration=f"{max_duration:g}",
+                                               max_distance=f"{max_distance:g}",
+                                               max_angle=f"{max_angle:g}")
 
     def parse(self, text):
         """Return (Intent, None) on success or (None, error_message) on failure."""
@@ -260,23 +470,72 @@ class MotionExecutor:
 
     A natural-language command is a single discrete instruction, but the node's
     0.4 s deadman (see MotionNode._publish_cmd) stops the robot unless commands
-    keep arriving. So this re-asserts the target velocity every 0.1 s for the
-    requested duration, then stops. The deadman stays in place underneath as the
+    keep arriving. So this re-asserts the target velocity on a short cycle until
+    the goal is met, then stops. The deadman stays in place underneath as the
     backstop: if this thread dies, the robot halts within 0.4 s.
+
+    Three kinds of goal:
+      duration  open-loop on the wall clock. The only one that works without
+                odometry, and so the fallback when /odom is unavailable.
+      distance  closed-loop on /odom position, in meters.
+      angle     closed-loop on /odom unwrapped yaw, in degrees.
+
+    The control loop deliberately lives on its own thread and touches the node
+    only through set_velocity(). It must never move into the ROS timer callback:
+    a bug in here would then wedge the deadman publisher itself.
     """
 
     SPEED_FRAC = {"slow": 0.4, "normal": 0.7, "fast": 1.0}
 
-    def __init__(self, node: MotionNode, max_lin, max_ang, max_duration):
+    # Closed-loop control period. Odometry arrives at 20 Hz and the command
+    # publisher runs at 20 Hz, so 0.05 s adds no avoidable latency; at 0.1 s the
+    # decision lag alone would cost ~11 degrees of overshoot on a normal-speed
+    # turn. Anything above ~0.2 s would start tripping the 0.4 s deadman.
+    TICK = 0.05
+    TICK_DURATION = 0.1          # open-loop re-assert period (unchanged)
+
+    # Speed floor. A Burger below roughly 0.01 m/s or 0.1 rad/s buzzes without
+    # moving, so we never command less than about twice that.
+    MIN_LIN = 0.02               # m/s
+    MIN_ANG = 0.15               # rad/s
+
+    TOL_LIN = 0.01               # m    "close enough to stop"
+    TOL_ANG = math.radians(2.0)
+    RAMP_LIN = 0.10              # m    start easing off this far out
+    RAMP_ANG = math.radians(25.0)
+
+    ODOM_STALE = 0.5             # s    abort if odom goes quiet this long
+    STALL_WINDOW = 1.5           # s    progress watchdog window
+    STALL_LIN = 0.002            # m    minimum progress within that window
+    STALL_ANG = math.radians(1.0)
+    TIMEOUT_FACTOR = 3.0         # x ideal time...
+    TIMEOUT_MARGIN = 2.0         # s ...plus this
+
+    # Pause between chained steps, so the next one reads a start pose the robot
+    # is actually at. The robot itself stops in well under 50 ms from the ramp's
+    # floor speed -- what this really waits out is odometry latency, since
+    # get_odom() returns the last sample RECEIVED, up to a 20 Hz period plus
+    # Wi-Fi transport old. 0.35 s lets several fresh samples land after the
+    # robot is genuinely still, and stays under the 0.4 s deadman so a healthy
+    # chain never enters deadman territory.
+    SETTLE = 0.35
+
+    def __init__(self, node: MotionNode, max_lin, max_ang, max_duration,
+                 max_distance=2.0, max_angle=360.0, goal_timeout_max=60.0):
         self._node = node
         self._max_lin = max_lin
         self._max_ang = max_ang
         self._max_duration = max_duration
+        self._max_distance = max_distance
+        self._max_angle = max_angle
+        self._goal_timeout_max = goal_timeout_max
         self._lock = threading.Lock()
         self._thread = None
         self._run_state = None
         self._active = None
         self._ends_at = 0.0
+        self._progress = 0.0      # in display units (s, m or deg)
+        self._last_result = None
 
     # --- lifecycle -------------------------------------------------------- #
     def _abort(self, stop_on_exit):
@@ -296,11 +555,31 @@ class MotionExecutor:
         if stop:
             self._node.stop()
 
-    def start(self, action, duration_s, speed):
-        """Begin a motion. Returns (duration, lin, ang) after clamping."""
-        duration = clamp(float(duration_s), 0.0, self._max_duration)
-        frac = self.SPEED_FRAC.get(speed, 0.7)
+    @classmethod
+    def _timeout_for(cls, goal, cruise, hard_max):
+        """Wall-clock ceiling for a closed-loop goal.
 
+        This is what keeps "every motion ends by itself" true once the stopping
+        condition depends on the robot actually moving. Three times the ideal
+        time plus a margin covers the ramp tail (crossed at roughly half cruise)
+        and a robot running slow on carpet or a flat battery, while still
+        bounding how long a stuck one can grind.
+        """
+        if goal <= 0.0 or cruise <= 0.0:
+            return 0.0
+        return clamp(goal / cruise * cls.TIMEOUT_FACTOR + cls.TIMEOUT_MARGIN,
+                     0.0, hard_max)
+
+    def _plan_step(self, action, speed, mode="duration", value=0.0):
+        """Work out (info, spec) for one motion without starting anything.
+
+        Split out from start() so the HTTP layer can price a whole chain against
+        the exact numbers the executor will run, rather than a reimplementation
+        that can drift.
+
+        `value` is in the unit implied by `mode`: seconds, meters or degrees.
+        """
+        frac = self.SPEED_FRAC.get(speed, 0.7)
         lin = ang = 0.0
         if action == "forward":
             lin = self._max_lin * frac
@@ -313,44 +592,267 @@ class MotionExecutor:
         lin = clamp(lin, -self._max_lin, self._max_lin)
         ang = clamp(ang, -self._max_ang, self._max_ang)
 
+        # Clamp the goal again even though /nl already did. Same belt-and-braces
+        # the duration cap has always had -- this method is reachable from
+        # anywhere, and a cap that only lives at the HTTP edge isn't a cap.
+        if mode == "distance":
+            shown = clamp(float(value), 0.0, self._max_distance)
+            goal, cruise, floor, to_disp = shown, abs(lin), self.MIN_LIN, 1.0
+        elif mode == "angle":
+            shown = clamp(float(value), 0.0, self._max_angle)
+            goal = math.radians(shown)
+            cruise, floor, to_disp = abs(ang), self.MIN_ANG, 180.0 / math.pi
+        else:
+            mode = "duration"
+            shown = clamp(float(value), 0.0, self._max_duration)
+            goal, cruise, floor, to_disp = shown, 0.0, 0.0, 1.0
+
+        timeout = (goal if mode == "duration"
+                   else self._timeout_for(goal, cruise, self._goal_timeout_max))
+
+        info = {"action": action, "speed": speed, "mode": mode,
+                "goal": round(shown, 3), "unit": MODE_UNIT[mode],
+                "lin": round(lin, 3), "ang": round(ang, 3),
+                "duration_s": round(shown if mode == "duration" else 0.0, 3),
+                "timeout_s": round(timeout, 2)}
+        spec = {"mode": mode, "goal": goal, "cruise": cruise, "floor": floor,
+                "timeout": timeout, "to_disp": to_disp, "lin": lin, "ang": ang}
+        return info, spec
+
+    def plan(self, steps):
+        """[(action, speed, mode, value), ...] -> [(info, spec), ...]."""
+        return [self._plan_step(*s) for s in steps]
+
+    def start(self, action, speed, mode="duration", value=0.0):
+        """Begin a single motion. Signature and return shape unchanged."""
+        return self.start_planned(self.plan([(action, speed, mode, value)]))
+
+    def start_planned(self, planned):
+        """Run a chain of pre-planned steps on ONE thread under ONE cancel event.
+
+        The whole chain deliberately shares a single cancel event, so the three
+        existing preemption sites (/cmd, /stop, and a typed "stop") abort the
+        entire sequence without knowing sequences exist. The alternatives --
+        starting the next step from _run's finally, or a separate runner calling
+        start() per step -- race _abort(): it sets cancel, then joins with a
+        timeout, so a thread that spawns its successor can leave _abort
+        returning with a brand new motion already running. That is the STOP
+        button failing to stop the robot, so it is not a style choice.
+        """
+        infos = [dict(i, step=n + 1, steps=len(planned))
+                 for n, (i, _) in enumerate(planned)]
+        specs = [sp for _, sp in planned]
+
         # Replace any in-flight motion; don't stop, we're about to drive.
         self._abort(stop_on_exit=False)
 
-        state = {"cancel": threading.Event(), "stop_on_exit": True}
-        thread = threading.Thread(target=self._run, args=(state, lin, ang, duration),
-                                  daemon=True)
+        runnable = [sp["goal"] > 0.0 and (sp["mode"] == "duration"
+                                          or sp["cruise"] > 0.0) for sp in specs]
+        if not any(runnable):
+            # Nothing to do. Don't spawn a thread just to have it exit at once.
+            self._node.stop()
+            return dict(infos[0], started=False)
+
+        state = {"cancel": threading.Event(), "stop_on_exit": True,
+                 # infos live in state, not on self: a thread that outlived its
+                 # join must never read a newer chain's plan.
+                 "infos": infos}
+        thread = threading.Thread(target=self._run, args=(state, specs), daemon=True)
         with self._lock:
             self._run_state = state
             self._thread = thread
-            self._active = {"action": action, "duration_s": duration,
-                            "speed": speed, "lin": round(lin, 3),
-                            "ang": round(ang, 3)}
-            self._ends_at = time.time() + duration
+            self._active = dict(infos[0])
+            self._ends_at = time.monotonic() + infos[0]["timeout_s"]
+            self._progress = 0.0
         thread.start()
-        return duration, lin, ang
+        return dict(infos[0], started=True)
 
-    def _run(self, state, lin, ang, duration):
-        end = time.time() + duration
+    def _set_progress(self, state, shown):
+        """Publish progress, but only while we're still the current motion.
+
+        No step bookkeeping needed here: `state` is per-CHAIN, so this guard
+        already means "still the current chain".
+        """
+        with self._lock:
+            if self._run_state is state:
+                self._progress = shown
+
+    def _begin_step(self, state, idx):
+        """Hand the readout to the next step of a chain.
+
+        _active is mutated, never nulled, so status()["running"] stays true for
+        the whole chain and the GUI's fast poller -- which tears itself down the
+        moment it sees running go false -- survives the step boundary.
+        """
+        info = state["infos"][idx]
+        with self._lock:
+            if self._run_state is not state:
+                return
+            self._active = dict(info)
+            self._ends_at = time.monotonic() + info["timeout_s"]
+            self._progress = 0.0
+
+    def _run(self, state, specs):
+        """Run each step in turn, abandoning the rest if one doesn't finish."""
+        t_chain = time.monotonic()
+        reason, last = "done", 0
         try:
-            while not state["cancel"].is_set() and time.time() < end:
-                self._node.set_velocity(lin, ang)
-                state["cancel"].wait(0.1)   # returns immediately once cancelled
+            for idx, spec in enumerate(specs):
+                if idx:
+                    # Come to rest before the next step reads its start pose.
+                    # Commanded explicitly rather than left to the deadman --
+                    # waiting on that would mean 0.4 s of continued motion at
+                    # the last velocity, which is the opposite of settling.
+                    self._node.stop()
+                    # wait(), never sleep(): a sleep here would be a window in
+                    # which STOP does nothing while _abort's join still returns.
+                    if state["cancel"].wait(self.SETTLE):
+                        reason = "cancelled"
+                        break
+                    self._begin_step(state, idx)
+                # Track the step that actually ran separately from the loop
+                # index: if a cancel lands during the settle above, idx has
+                # already moved to a step that never started, and reporting it
+                # would pair that step's goal with the previous step's progress.
+                last = idx
+                reason = self._run_one(state, spec)
+                if reason != "done":
+                    # A step that ended any other way leaves the robot somewhere
+                    # the remaining steps weren't written for -- a turn that
+                    # stopped short means the next "forward" goes the wrong way.
+                    break
         finally:
+            spec = specs[last]
+            to_disp = spec["to_disp"]
             if state["stop_on_exit"]:
                 self._node.stop()
             with self._lock:
+                # Only the current motion may touch shared state: an older
+                # thread that outlived its join must not clobber a newer one.
                 if self._run_state is state:
+                    self._last_result = {
+                        "reason": reason, "mode": spec["mode"],
+                        "goal": round(spec["goal"] * to_disp, 3),
+                        "progress": round(self._progress, 3),
+                        "unit": MODE_UNIT[spec["mode"]],
+                        "elapsed_s": round(time.monotonic() - t_chain, 2),
+                        "step": last + 1, "steps": len(specs),
+                        "action": state["infos"][last]["action"],
+                    }
                     self._run_state = None
                     self._thread = None
                     self._active = None
 
+    def _run_one(self, state, spec):
+        """Drive one step to its goal. Returns the reason it ended."""
+        mode, goal, to_disp = spec["mode"], spec["goal"], spec["to_disp"]
+        lin, ang = spec["lin"], spec["ang"]
+        t0 = time.monotonic()
+        deadline = t0 + spec["timeout"]
+
+        if mode == "duration":
+            while not state["cancel"].is_set() and time.monotonic() < deadline:
+                self._node.set_velocity(lin, ang)
+                self._set_progress(state, min(goal, time.monotonic() - t0))
+                state["cancel"].wait(self.TICK_DURATION)
+            if state["cancel"].is_set():
+                return "cancelled"
+            self._set_progress(state, goal)
+            return "done"
+
+        snap = self._node.get_odom()
+        if snap is None:
+            return "no odometry"
+        # The pose we measure FROM has to be fresh too, not just the ones we
+        # measure against. Without this a stale start pose reads as instantly
+        # "done" -- a narrow race for one command, but a chain can put tens of
+        # seconds between the endpoint's freshness check and a later step.
+        if snap[3] > self.ODOM_STALE:
+            return "odometry stalled"
+        x0, y0, yaw0, _ = snap
+        # A past discontinuity stops mattering the moment we re-snapshot: the
+        # yaw accumulator only has to be continuous WITHIN a motion. Without
+        # this the flag is sticky and one jump disables closed-loop control
+        # until the server restarts.
+        self._node.odom_broken = False
+
+        linear = (mode == "distance")
+        cruise, floor = spec["cruise"], spec["floor"]
+        tol = self.TOL_LIN if linear else self.TOL_ANG
+        ramp = self.RAMP_LIN if linear else self.RAMP_ANG
+        stall = self.STALL_LIN if linear else self.STALL_ANG
+        sign = 1.0 if (lin if linear else ang) >= 0.0 else -1.0
+
+        best, best_t = 0.0, t0
+        while True:
+            if state["cancel"].is_set():
+                return "cancelled"
+            od = self._node.get_odom()
+            if od is None or od[3] > self.ODOM_STALE:
+                return "odometry stalled"
+            if self._node.odom_broken:
+                return "odometry jumped"
+            x, y, yaw, _ = od
+
+            if linear:
+                # Straight-line displacement from the starting pose. Exact
+                # for forward/backward and immune to yaw drift. Summing
+                # per-sample hypot() instead would be strictly worse: under a
+                # square root the noise is always positive, so a parked robot
+                # would slowly accrue phantom distance. This assumption
+                # breaks the day someone adds a curved-arc action.
+                done = math.hypot(x - x0, y - y0)
+            else:
+                # yaw is the unwrapped accumulator, so this keeps climbing
+                # past half a turn instead of folding at pi.
+                done = max(0.0, sign * (yaw - yaw0))
+            self._set_progress(state, done * to_disp)
+
+            err = goal - done
+            if err <= tol:
+                return "done"
+
+            now = time.monotonic()
+            if now > deadline:
+                return "timed out"
+            if done > best + stall:
+                best, best_t = done, now
+            elif now - best_t > self.STALL_WINDOW:
+                # Wheels blocked, or odometry frozen while still arriving.
+                return "no progress"
+
+            # Ease proportionally into the goal. Without this the stop
+            # decision lands ~150 ms late at cruise speed, which is 2 cm or
+            # 17 degrees of overshoot; slowing to the floor speed first cuts
+            # it to millimetres. Note it's the floor, not the tolerance, that
+            # bounds overshoot -- and a floor set too low stalls short.
+            mag = cruise * clamp(err / ramp, 0.0, 1.0)
+            mag = clamp(max(mag, floor), 0.0, cruise)
+            self._node.set_velocity(sign * mag if linear else 0.0,
+                                    0.0 if linear else sign * mag)
+            state["cancel"].wait(self.TICK)
+
     def status(self):
         with self._lock:
             active = dict(self._active) if self._active else None
-            ends_at = self._ends_at
+            ends_at, progress = self._ends_at, self._progress
+            last = dict(self._last_result) if self._last_result else None
         if active is not None:
-            active["remaining_s"] = max(0.0, round(ends_at - time.time(), 1))
-        return {"running": active is not None, "motion": active}
+            # For a closed-loop goal this is time left on the timeout backstop,
+            # not an ETA -- a healthy motion finishes long before it.
+            active["remaining_s"] = max(0.0, round(ends_at - time.monotonic(), 1))
+            active["progress"] = round(progress, 3)
+            goal = active.get("goal") or 0.0
+            frac = clamp(progress / goal, 0.0, 1.0) if goal > 0 else 0.0
+            active["progress_pct"] = int(frac * 100)
+            # Progress across the whole chain. Monotonic, unlike a per-step bar
+            # that would reset 100 -> 0 at each boundary (and the CSS width
+            # transition would animate that reset as a backwards sweep).
+            # Identical to progress_pct when there's only one step.
+            n, k = active.get("steps", 1), active.get("step", 1)
+            active["chain_pct"] = int(clamp((k - 1 + frac) / n, 0.0, 1.0) * 100)
+        return {"running": active is not None, "motion": active,
+                "last_result": last}
 
 
 # --------------------------------------------------------------------------- #
@@ -358,9 +860,21 @@ class MotionExecutor:
 # --------------------------------------------------------------------------- #
 def build_app(node: MotionNode, max_lin, max_ang,
               parser: Optional[NLParser] = None, nl_max_duration=10.0,
+              nl_max_distance=2.0, nl_max_angle=360.0, goal_timeout_max=60.0,
+              nl_max_steps=5, nl_max_chain_distance=3.0,
+              nl_max_chain_angle=720.0, nl_max_chain_seconds=120.0,
               link_check=False):
     app = FastAPI()
-    executor = MotionExecutor(node, max_lin, max_ang, nl_max_duration)
+    executor = MotionExecutor(node, max_lin, max_ang, nl_max_duration,
+                              max_distance=nl_max_distance,
+                              max_angle=nl_max_angle,
+                              goal_timeout_max=goal_timeout_max)
+    goal_caps = {"duration": nl_max_duration, "distance": nl_max_distance,
+                 "angle": nl_max_angle}
+    # Whole-chain budgets. Every one is a strict superset of its per-step
+    # counterpart, which is what guarantees none of them can bind on a single
+    # command -- the backward-compatibility property, expressed as arithmetic.
+    chain_caps = {"distance": nl_max_chain_distance, "angle": nl_max_chain_angle}
 
     @app.get("/", response_class=HTMLResponse)
     def index():
@@ -410,64 +924,223 @@ def build_app(node: MotionNode, max_lin, max_ang,
             return JSONResponse({"executed": False, "action": "unknown",
                                  "message": "say something first"})
 
-        intent, error = parser.parse(text)
-        if error is not None:
+        frags = split_steps(text)
+        if not frags:
             return JSONResponse({"executed": False, "action": "unknown",
-                                 "message": error})
+                                 "message": "say something first"})
 
-        requested = intent.duration_s
-        duration = clamp(float(requested), 0.0, nl_max_duration)
-        capped = abs(duration - requested) > 1e-6
+        def at(i, msg):
+            """Prefix a per-step message with its position -- but only for a
+            real chain, so a single command's message is byte-identical."""
+            return msg if len(frags) == 1 else \
+                f'step {i + 1} of {len(frags)} ("{frags[i]}"): {msg}'
 
-        result = {"action": intent.action, "speed": intent.speed,
-                  "duration_s": duration, "requested_duration_s": requested,
-                  "capped": capped, "executed": False}
+        # Refuse an over-long chain BEFORE parsing: no point paying five LLM
+        # round-trips to reject something on a count we already know.
+        if len(frags) > nl_max_steps:
+            return JSONResponse(
+                {"executed": False, "action": "unknown", "steps": len(frags),
+                 "message": f"that's {len(frags)} steps - I take at most "
+                            f"{nl_max_steps} at a time"})
 
-        if intent.action == "unknown":
-            result["message"] = f'"{text}" is not a driving command I understand'
-            return JSONResponse(result)
+        # Parse every fragment before anything moves. Discovering at step 3 that
+        # it's nonsense, having already driven steps 1 and 2, is exactly the
+        # failure this ordering exists to prevent. Fail fast on the first error
+        # so a wedged model costs one timeout, not N.
+        intents = []
+        for i, frag in enumerate(frags):
+            intent, error = parser.parse(frag)
+            if error is not None:
+                return JSONResponse({"executed": False, "action": "unknown",
+                                     "failed_step": i + 1,
+                                     "message": at(i, error)})
+            intents.append(intent)
 
-        if intent.action == "stop":
-            if not dry_run:
-                executor.cancel(stop=True)
-            result["executed"] = not dry_run
-            result["message"] = "stopping"
-            return JSONResponse(result)
+        # "go forward 1 m then stop" is natural, and a chain always ends stopped
+        # anyway, so a trailing stop is simply dropped. Done before the lone-stop
+        # check below so "halt, halt" collapses to the plain stop path.
+        while len(intents) > 1 and intents[-1].action == "stop":
+            intents.pop()
+            frags.pop()
+
+        odom = node.get_odom()
+        chained = len(intents) > 1
+
+        if not chained:
+            intent = intents[0]
+            mode = intent.mode
+            unit = MODE_UNIT[mode]
+            requested = float(intent.value)
+            value = clamp(requested, 0.0, goal_caps[mode])
+            capped = abs(value - requested) > 1e-6
+            result = {"action": intent.action, "speed": intent.speed,
+                      "mode": mode, "unit": unit,
+                      "value": value, "requested_value": requested,
+                      # Kept so anything parsing the old shape still works. For
+                      # a closed-loop goal there is no meaningful duration up
+                      # front.
+                      "duration_s": value if mode == "duration" else 0.0,
+                      "requested_duration_s": (requested if mode == "duration"
+                                               else 0.0),
+                      "capped": capped, "executed": False,
+                      "steps": 1, "odom_ok": odom is not None}
+
+            if intent.action == "stop":
+                # stop ignores mode and value entirely, so a mis-tagged mode
+                # must never be allowed to block it.
+                if not dry_run:
+                    executor.cancel(stop=True)
+                result["executed"] = not dry_run
+                result["message"] = "stopping"
+                return JSONResponse(result)
+        else:
+            result = {"action": intents[0].action, "speed": intents[0].speed,
+                      "executed": False, "steps": len(intents),
+                      "odom_ok": odom is not None}
+
+        # A stop in the MIDDLE is refused rather than executed-then-truncated:
+        # truncating would discard the trailing steps only after the robot had
+        # already moved, which is the same "found out too late" failure that
+        # parsing everything up front exists to avoid. It's ambiguous anyway --
+        # "pause here" or "cancel the rest"?
+        for i, intent in enumerate(intents):
+            if intent.action == "stop":
+                return JSONResponse(dict(
+                    result, failed_step=i + 1,
+                    message=f'"{frags[i]}" in the middle of a sequence - say it '
+                            "on its own to stop the robot"))
+
+        # Per-step validation. Every step is checked before any of them runs.
+        plan_args, totals = [], {"distance": 0.0, "angle": 0.0}
+        for i, intent in enumerate(intents):
+            mode = intent.mode
+            if intent.action == "unknown":
+                return JSONResponse(dict(
+                    result, failed_step=i + 1,
+                    message=at(i, f'"{frags[i]}" is not a driving command '
+                                  "I understand")))
+            # Mode has to make sense for the action. Refuse rather than repair:
+            # "forward" plus "angle" could be a mis-tagged distance or an
+            # intended rotate, and there's no way to tell -- guessing wrong
+            # drives the robot somewhere it was never asked to go.
+            if ((intent.action in LINEAR_ACTIONS and mode == "angle") or
+                    (intent.action in ANGULAR_ACTIONS and mode == "distance")):
+                return JSONResponse(dict(
+                    result, failed_step=i + 1,
+                    message=at(i, f'"{frags[i]}" mixes up moving and turning - '
+                                  "forward and backward take meters or seconds, "
+                                  "rotating takes degrees or seconds")))
+            v = clamp(float(intent.value), 0.0, goal_caps[mode])
+            if mode in totals:
+                totals[mode] += v
+            plan_args.append((intent.action, intent.speed, mode, v))
+
+        planned = executor.plan(plan_args)
+
+        # Whole-chain budgets. Refused, not clamped -- deliberately unlike the
+        # per-step caps. A per-step cap has a repair the user can see in their
+        # own phrase ("capped from 5m"); trimming a chain to fit is arbitrary
+        # (which step loses out?) and lands the robot somewhere they cannot
+        # predict from what they typed.
+        if chained:
+            for mode, total in totals.items():
+                if total > chain_caps[mode] + 1e-6:
+                    return JSONResponse(dict(
+                        result, message=(
+                            f"that's {total:g}{MODE_UNIT[mode]} of {mode} across "
+                            f"{len(intents)} steps - the limit for one sequence "
+                            f"is {chain_caps[mode]:g}{MODE_UNIT[mode]}")))
+            budget = sum(i["timeout_s"] for i, _ in planned)
+            if budget > nl_max_chain_seconds + 1e-6:
+                return JSONResponse(dict(
+                    result, message=(
+                        f"that sequence could take up to {budget:g}s - the limit "
+                        f"for one sequence is {nl_max_chain_seconds:g}s")))
 
         # Refuse to drive blind when the robot link is known to be down.
         if link_check and node.link_rtt_ms is None and not dry_run:
             result["message"] = "robot link is down - not sending a motion command"
             return JSONResponse(result)
 
+        # A distance or angle goal is only as good as the odometry it measures
+        # against. With no odom we refuse rather than silently falling back to
+        # "distance / speed = time" -- a guess dressed up as a measurement is
+        # exactly the surprise that makes a robot dangerous. Checked once for
+        # the whole chain; each step re-checks staleness as it runs.
+        closed = [m for _, _, m, _ in plan_args if m in ("distance", "angle")]
+        if closed and not dry_run:
+            mode = closed[0]
+            if odom is None:
+                result["message"] = (
+                    f"no odometry from the robot yet - {mode} commands need "
+                    "/odom (is the robot bringup running?)")
+                return JSONResponse(result)
+            if odom[3] > 1.0:
+                result["message"] = (f"odometry is {odom[3]:.1f}s stale - "
+                                     f"refusing a closed-loop {mode} command")
+                return JSONResponse(result)
+
+        def phrase_of(info):
+            p = info["action"].replace("_", " ") + " "
+            return p + (f"for {info['goal']:g}s" if info["mode"] == "duration"
+                        else f"{info['goal']:g} {info['unit']}")
+
+        if chained:
+            phrase = f"{len(planned)} steps: " + "; then ".join(
+                phrase_of(i) for i, _ in planned)
+            note = ""
+        else:
+            note = f" (capped from {requested:g}{unit})" if capped else ""
+            phrase = phrase_of(planned[0][0])
+
+        result["plan"] = [dict(i) for i, _ in planned]
+
         if dry_run:
-            result["message"] = f"[dry run] {intent.action} for {duration:g}s ({intent.speed})"
+            result["message"] = (f"[dry run] {phrase} at "
+                                 f"{intents[0].speed} speed{note}")
             return JSONResponse(result)
 
-        duration, lin, ang = executor.start(intent.action, duration, intent.speed)
-        result.update({"executed": True, "duration_s": duration,
-                       "lin": round(lin, 3), "ang": round(ang, 3)})
-        note = f" (capped from {requested:g}s)" if capped else ""
-        result["message"] = (f"{intent.action.replace('_', ' ')} for "
-                             f"{duration:g}s at {intent.speed} speed{note}")
+        started = executor.start_planned(planned)
+        result.update({"executed": bool(started["started"]),
+                       "timeout_s": started["timeout_s"],
+                       "lin": started["lin"], "ang": started["ang"]})
+        if not chained:
+            result.update({"value": started["goal"],
+                           "duration_s": started["duration_s"]})
+        result["message"] = (f"{phrase} at {intents[0].speed} speed{note}"
+                             if started["started"] else "nothing to do")
         return JSONResponse(result)
 
     @app.get("/nl/status")
     def nl_status():
+        age, hz, count = node.odom_stats()
         return JSONResponse({"enabled": parser is not None,
                              "model": parser.model if parser else None,
                              "max_duration_s": nl_max_duration,
+                             "max_distance_m": nl_max_distance,
+                             "max_angle_deg": nl_max_angle,
+                             "max_steps": nl_max_steps,
+                             "odom_ok": age is not None and age <= 1.0,
+                             "odom_age_s": None if age is None else round(age, 2),
                              **executor.status()})
 
     @app.get("/status")
     def status():
+        age, hz, count = node.odom_stats()
         return JSONResponse({
             "frames": node.frames_received,
             "image_topic": node.image_topic,
             "cmd_vel_topic": node.cmd_vel_topic,
+            "odom_topic": node.odom_topic,
             "max_lin": max_lin,
             "max_ang": max_ang,
             "link_rtt_ms": node.link_rtt_ms,
             "cmd_cycle_ms": 50,  # 20 Hz command publisher
+            # Exposed so the choice to keep one spin thread stays measurable:
+            # if odom_age_ms starts climbing, the camera decode is crowding it.
+            "odom_count": count,
+            "odom_hz": hz,
+            "odom_age_ms": None if age is None else round(age * 1000),
         })
 
     return app
@@ -506,6 +1179,9 @@ HTML_PAGE = """
          font-variant-numeric:tabular-nums; }
   #lat { font-size:12px; color:#d0a15e; margin:0 0 8px;
          font-variant-numeric:tabular-nums; }
+  #prog { display:none; margin:0 0 8px; }
+  #progbar { height:4px; background:#2a2a2a; border-radius:2px; overflow:hidden; }
+  #progfill { height:100%; width:0%; background:#3d7eff; transition:width .12s linear; }
   .row { margin:10px auto; max-width:640px; font-size:14px; }
   input[type=range] { width:55%; vertical-align:middle; }
   .hint { color:#888; font-size:13px; margin-top:14px; }
@@ -542,6 +1218,7 @@ HTML_PAGE = """
    <div class="panel">
     <div id="vel">v = 0.00 m/s &nbsp; ω = 0.00 rad/s</div>
     <div id="lat" title="Time from a teleop command to the robot acting on it: network link + 50 ms command cycle + motor response.">teleop latency: measuring…</div>
+    <div id="prog"><div id="progbar"><div id="progfill"></div></div></div>
     <div class="pad">
       <button class="k" data-keys="wa"><span class="arw">↖</span><span class="lbl">Fwd-Left</span></button>
       <button class="k" data-keys="w"><span class="arw">↑</span><span class="lbl">Forward</span></button>
@@ -570,7 +1247,7 @@ HTML_PAGE = """
       <h2>Say it in plain English</h2>
       <div class="nlrow">
         <input id="nltext" type="text" autocomplete="off"
-               placeholder="e.g. move forward for 3 seconds"/>
+               placeholder="e.g. move forward 1 meter"/>
         <button id="nlsend">Send</button>
       </div>
       <div id="nllog"></div>
@@ -681,16 +1358,23 @@ async function sendNL() {
   nlText.value = '';
   nlSend.disabled = true;
   const pending = logLine('pending', 'thinking…');
+  // Each step costs its own model round-trip, so a sequence sits here for
+  // several seconds. Say so rather than looking hung.
+  const slow = setTimeout(() => {
+    pending.textContent = 'thinking… (multi-step commands take longer)';
+  }, 4000);
   try {
     const r = await fetch('/nl', {method:'POST',
       headers:{'Content-Type':'application/json'}, body: JSON.stringify({text:t})});
     const d = await r.json();
     pending.remove();
     logLine(d.executed ? 'ok' : 'no', d.message || 'no response');
+    if (d.executed) startProgressPoll();
   } catch (e) {
     pending.remove();
     logLine('no', 'server unreachable');
   } finally {
+    clearTimeout(slow);
     nlSend.disabled = false;
     nlText.focus();
   }
@@ -700,6 +1384,67 @@ if (NL_ENABLED) {
   nlText.addEventListener('keydown', e => {
     if (e.key === 'Enter') { e.preventDefault(); sendNL(); }
   });
+}
+
+const progEl   = document.getElementById('prog');
+const progFill = document.getElementById('progfill');
+
+function renderMotion(m) {
+  if (!m) { progEl.style.display = 'none'; return; }
+  const chained = (m.steps ?? 1) > 1;
+  let head = chained ? `step ${m.step}/${m.steps} · ` : '';
+  head += m.action.replace('_',' ') + ' · ';
+  if (m.mode && m.mode !== 'duration') {
+    // Closed-loop: show measured progress. Deliberately not remaining_s --
+    // that's the timeout backstop, and a healthy motion finishes long before
+    // it, so showing it would read as a wildly pessimistic ETA.
+    head += `${(m.progress ?? 0).toFixed(2)} of ${(m.goal ?? 0).toFixed(2)} ${m.unit}`;
+  } else {
+    head += `${(m.remaining_s ?? 0).toFixed(1)}s left`;
+  }
+  // For a chain, track the whole sequence: chain_pct only ever grows, whereas a
+  // per-step bar would reset 100->0 at each boundary and the CSS width
+  // transition would animate that reset as a backwards sweep. It also keeps the
+  // bar on screen across a mixed chain, where a duration step would otherwise
+  // hide it and the next closed-loop step bring it back.
+  if (chained || (m.mode && m.mode !== 'duration')) {
+    progEl.style.display = '';
+    progFill.style.width = (chained ? (m.chain_pct ?? 0)
+                                    : (m.progress_pct ?? 0)) + '%';
+  } else {
+    progEl.style.display = 'none';
+  }
+  velEl.textContent = head + ` (v = ${m.lin.toFixed(2)}  ω = ${m.ang.toFixed(2)})`;
+}
+
+// A 30° turn is over in about a quarter of a second, so the 1 Hz status poll
+// would miss the whole motion. Poll fast, but only while one is running.
+let progTimer = null;
+function startProgressPoll() {
+  if (progTimer) return;
+  progTimer = setInterval(async () => {
+    try {
+      const s = await (await fetch('/nl/status')).json();
+      renderMotion(s.motion);
+      if (!s.running) {
+        clearInterval(progTimer); progTimer = null;
+        progEl.style.display = 'none';
+        showVel(0, 0);
+        // Say why it ended. A motion that timed out or hit the progress
+        // watchdog stopped short, and without this the log still shows the
+        // cheerful acceptance message as if all had gone to plan.
+        const r = s.last_result;
+        const where = (r && r.steps > 1)
+          ? `step ${r.step}/${r.steps} (${r.action.replace('_',' ')}) ` : '';
+        if (r && r.reason !== 'done' && r.reason !== 'cancelled')
+          logLine('no', `${where}stopped: ${r.reason} — ${r.progress} of ${r.goal} ${r.unit}`);
+        // A plain cancel stays silent -- you pressed STOP, you know. But that
+        // you also discarded the steps after this one is news.
+        else if (r && r.reason === 'cancelled' && r.steps > 1 && r.step < r.steps)
+          logLine('no', `cancelled at step ${r.step} of ${r.steps}`);
+      }
+    } catch (e) { clearInterval(progTimer); progTimer = null; }
+  }, 150);
 }
 
 async function poll() {
@@ -721,12 +1466,11 @@ async function poll() {
   } catch(e) {
     document.getElementById('status').textContent = 'server unreachable';
   }
-  if (NL_ENABLED) {
+  // Catch a motion started elsewhere (another tab, curl) and hand it to the
+  // fast poller; while that's running it owns the readout and we stay out.
+  if (NL_ENABLED && !progTimer) {
     try {
-      const m = (await (await fetch('/nl/status')).json()).motion;
-      if (m) velEl.textContent =
-        `${m.action.replace('_',' ')} · ${m.remaining_s.toFixed(1)}s left ` +
-        `(v = ${m.lin.toFixed(2)}  ω = ${m.ang.toFixed(2)})`;
+      if ((await (await fetch('/nl/status')).json()).running) startProgressPoll();
     } catch(e) {}
   }
 }
@@ -746,14 +1490,16 @@ def main():
     ap.add_argument("--image-type", default="auto",
                     choices=["auto", "raw", "compressed"])
     ap.add_argument("--cmd-vel-topic", default="/cmd_vel")
+    ap.add_argument("--odom-topic", default="/odom",
+                    help="odometry topic, used to measure distance and angle goals")
     ap.add_argument("--robot-ip", default="192.168.68.100",
                     help="robot IP, used to measure live teleop link latency "
                          "(set empty to disable)")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--max-lin", type=float, default=0.26,
+    ap.add_argument("--max-lin", type=float, default=0.22,
                     help="max linear speed (Burger=0.22, Waffle=0.26)")
-    ap.add_argument("--max-ang", type=float, default=1.82,
+    ap.add_argument("--max-ang", type=float, default=2.84,
                     help="max angular speed (Burger=2.84, Waffle=1.82)")
     ap.add_argument("--enable-nl", action="store_true",
                     help="enable natural-language driving via a local LLM")
@@ -763,11 +1509,28 @@ def main():
                     help="ollama model used to parse commands")
     ap.add_argument("--nl-max-duration", type=float, default=10.0,
                     help="hard cap (seconds) on any single typed motion")
+    ap.add_argument("--nl-max-distance", type=float, default=2.0,
+                    help="hard cap (meters) on any single typed distance goal")
+    ap.add_argument("--nl-max-angle", type=float, default=360.0,
+                    help="hard cap (degrees) on any single typed angle goal")
+    ap.add_argument("--goal-timeout-max", type=float, default=60.0,
+                    help="ceiling (seconds) on a closed-loop goal's timeout backstop")
+    # Whole-sequence budgets. The per-step caps above are per motion, so without
+    # these a 3-step chain of 2 m legs passes every check and drives 6 m.
+    ap.add_argument("--nl-max-steps", type=int, default=5,
+                    help="most steps allowed in one comma-separated sequence")
+    ap.add_argument("--nl-max-chain-distance", type=float, default=3.0,
+                    help="cap (meters) on total path length across a sequence")
+    ap.add_argument("--nl-max-chain-angle", type=float, default=720.0,
+                    help="cap (degrees) on total rotation across a sequence")
+    ap.add_argument("--nl-max-chain-seconds", type=float, default=120.0,
+                    help="cap (seconds) on a sequence's worst-case running time")
     args = ap.parse_args()
 
     rclpy.init()
     node = MotionNode(args.image_topic, args.cmd_vel_topic, args.image_type,
-                      robot_ip=(args.robot_ip or None))
+                      robot_ip=(args.robot_ip or None),
+                      odom_topic=args.odom_topic)
 
     spin = threading.Thread(
         target=lambda: rclpy.spin(node), daemon=True)
@@ -775,12 +1538,22 @@ def main():
 
     parser = None
     if args.enable_nl:
-        parser = NLParser(args.llm_url, args.llm_model, args.nl_max_duration)
+        parser = NLParser(args.llm_url, args.llm_model, args.nl_max_duration,
+                          args.nl_max_distance, args.nl_max_angle)
         print(f"  Natural language: {args.llm_model} via {args.llm_url} "
-              f"(max {args.nl_max_duration:g}s per command)")
+              f"(max {args.nl_max_duration:g}s, {args.nl_max_distance:g}m, "
+              f"{args.nl_max_angle:g}deg per step; up to {args.nl_max_steps} "
+              f"steps per sequence)")
 
     app = build_app(node, args.max_lin, args.max_ang, parser=parser,
                     nl_max_duration=args.nl_max_duration,
+                    nl_max_distance=args.nl_max_distance,
+                    nl_max_angle=args.nl_max_angle,
+                    goal_timeout_max=args.goal_timeout_max,
+                    nl_max_steps=args.nl_max_steps,
+                    nl_max_chain_distance=args.nl_max_chain_distance,
+                    nl_max_chain_angle=args.nl_max_chain_angle,
+                    nl_max_chain_seconds=args.nl_max_chain_seconds,
                     link_check=bool(args.robot_ip))
     print(f"\n  Open the GUI at:  http://localhost:{args.port}\n")
     try:
