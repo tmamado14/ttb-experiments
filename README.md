@@ -9,7 +9,9 @@ camera** live. It runs on a laptop and talks to the robot over Wi-Fi using ROS 2
 
 | File | Purpose |
 |------|---------|
-| `motion_server.py`  | The whole app: ROS 2 node + web server + GUI (one file). |
+| `motion_server.py`  | The app: ROS 2 node + web server + GUI. |
+| `vision.py`         | Open-vocabulary object detection (YOLO-World) for "go to the X". |
+| `seek.py`           | The seek behaviour: search, centre, approach — plus its target parser. |
 | `run_server.sh`     | Starts the server on the laptop using values from `.env`. |
 | `scripts/robot_start.sh` | Starts the robot's ROS nodes (motors + camera) over SSH. |
 | `scripts/robot_stop.sh`  | Stops the robot's ROS nodes (leaves it powered on). |
@@ -252,6 +254,128 @@ two consequences worth knowing:
   has no amount in step 2, so it falls back to the 2-second default; "turn right
   90, then left" gives you a 2-second left turn, not a 90° one. Spell each step
   out in full.
+
+## Going to an object: "go to the bottle"
+
+Set `ENABLE_SEEK=1` in `.env` (you also need a working `/scan` and YOLO-World
+weights at `SEEK_WEIGHTS`). Then, **in the GUI's "Say it in plain English" box**,
+type **"go to the bottle"**, "find the red backpack", or "approach the chair".
+
+The robot rotates in place until the camera finds the object, turns to face it,
+drives at it, and stops short of it.
+
+It is the same text box the driving commands use — routing happens on the server,
+so there is nothing to switch between "drive" and "go to". When seek is enabled
+the box shows clickable example phrases underneath, and the readout above reports
+the stage in plain words as it runs:
+
+```
+looking around · bottle
+turning to face it · bottle · seen 44%
+driving to it · bottle · 0.47 m away · seen 40%
+arrived · bottle · 0.35 m away
+```
+
+**"show what it sees"** under the camera swaps the live view for the same stream
+with detection boxes drawn on it, plus the centre line the robot aims at. Type
+any object name beside it. The robot does not move while you look — this is the
+quickest way to find out whether an object is detectable in your lighting before
+asking the robot to drive at it.
+
+### The language model does not do the seeing
+
+It extracts the object's **name** from your sentence and nothing else. That is
+the same rule the driving commands follow — the model is an intent parser and
+never a control or safety element.
+
+Finding the object is a real object detector (YOLO-World), because a
+vision-language model answers in prose rather than pixel coordinates and takes
+seconds per frame; the robot is moving the whole time it would be thinking.
+Detection here is ~19 ms/frame on a GPU.
+
+**How far away it is comes from the lidar, not the camera.** A single camera
+cannot measure distance without knowing how big the object is supposed to be.
+
+### Bearing from vision, range from the lidar
+
+The two are deliberately kept apart:
+
+1. **Search** — turn `SEEK_SEARCH_STEP` degrees, stop, look. Step-and-look
+   rather than a continuous sweep, because the camera feed is ~7 Hz over Wi-Fi
+   and a moving frame is a blurred one.
+2. **Centre** — rotate until the object sits on the middle of the frame.
+3. **Approach** — drive forward, steering to keep it centred, watching the
+   range straight ahead. Stop at `SEEK_STOP_DISTANCE`.
+
+Centring first is what removes any need to calibrate the camera's field of
+view: once the object is dead ahead, "how far away is it" is just "what is in
+front of me", which the lidar answers directly.
+
+### Why the range is a minimum and not an average
+
+`front_range()` reports the **20th percentile** of the valid beams in a ±10°
+sector — a robust minimum. Measured on this robot, that sector read a *minimum*
+of 1.97 m against a *median* of 2.60 m: the median was describing the wall
+behind the object while something sat two thirds of a metre nearer. For "stop
+before you hit it", the nearest thing in the path is the only correct quantity.
+A percentile rather than a bare minimum because single spurious short returns
+are common — a live scan had only 251 of 360 beams valid, with a `0.0` dropout
+sitting dead ahead.
+
+### How it stays safe
+
+Everything the typed motions already do (20 Hz publisher, 0.4 s deadman, one
+cancellable motion at a time, STOP preempting) applies unchanged — the seek runs
+on the *same* motion thread under the *same* cancel event, precisely so that
+STOP keeps meaning stop. On top of that:
+
+- **No lidar, no seek.** If `/scan` is missing or stale it refuses to start, and
+  aborts mid-approach if the lidar goes quiet. It never falls back to open loop.
+- **No range, no driving.** If the front sector returns nothing readable for
+  0.6 s, it stops. "I cannot see anything ahead" is not the same claim as "the
+  way is clear."
+- **Caps are refused, not trimmed**: `SEEK_MAX_TRAVEL` of approach,
+  `SEEK_SEARCH_MAX` of sweep, `SEEK_TIMEOUT` overall.
+- **Two of three frames** must contain the target before the robot will drive at
+  it. Open-vocabulary detection will happily put a low-confidence box on a noun
+  that isn't there.
+
+### Check the detector before you trust it
+
+`/detect` runs detection on the current frame and returns it annotated, **without
+moving the robot**. This is the first thing to try in a new room:
+
+```bash
+curl -s -D - -o out.jpg "http://localhost:8000/detect?target=bottle" | grep -i x-
+# X-Detections: 1   X-Best-Conf: 0.412   X-Infer-Ms: 19   X-Front-Range-M: 1.987
+```
+
+The confidence it reports is the number `SEEK_CONF` has to sit below. It is very
+lighting-dependent: in this room a chair in plain view scored 0.13–0.24, so the
+usual 0.25 threshold would have found *nothing*, while objects that were absent
+stayed under 0.07. Re-measure rather than assuming the default fits.
+
+To dry-run the language half without moving:
+
+```bash
+curl -s -X POST "localhost:8000/seek?dry_run=1" -H 'Content-Type: application/json' \
+     -d '{"text":"go to the red backpack"}'
+# -> {"action":"seek","target":"red backpack","executed":false,"dry_run":true,...}
+```
+
+### Limits worth knowing before you rely on it
+
+- **The lidar only sees its own scan plane, ~18 cm up.** A bottle on a table is
+  detected by the camera and returns no range, so the approach refuses to drive.
+  Floor-level objects are what this is built for.
+- **The LDS-01 only sees 3.5 m at all**, which is why the travel cap is 2.5 m.
+- **The camera's horizontal field of view is its narrow axis** (it is mounted
+  rotated), so the search steps are small. Turning `SEEK_SEARCH_STEP` up makes
+  searching quicker and makes it walk straight past things.
+- **A seek can't be chained** with other steps yet — "forward 0.5 m, go to the
+  bottle" is refused rather than half-executed.
+- **Nothing here avoids obstacles.** It drives at the target in a straight line
+  and stops for whatever is nearest in front — which may not be the target.
 
 ## Security
 

@@ -37,6 +37,23 @@ if [[ "${ENABLE_NL:-0}" == "1" ]]; then
            --nl-max-chain-seconds "${NL_MAX_CHAIN_SECONDS:-120}")
 fi
 
+# --- optional visual seek ("go to the bottle") --------------------------------
+# Needs the lidar as well as the camera: vision supplies the bearing, /scan
+# supplies the range it stops on.
+SEEK_ARGS=()
+if [[ "${ENABLE_SEEK:-0}" == "1" ]]; then
+  SEEK_ARGS=(--enable-seek
+             --scan-topic "${SCAN_TOPIC:-/scan}"
+             --seek-weights "${SEEK_WEIGHTS:-yolov8m-world.pt}"
+             --seek-conf "${SEEK_CONF:-0.15}"
+             --seek-stop-distance "${SEEK_STOP_DISTANCE:-0.35}"
+             --seek-max-travel "${SEEK_MAX_TRAVEL:-2.5}"
+             --seek-search-step "${SEEK_SEARCH_STEP:-25}"
+             --seek-search-max "${SEEK_SEARCH_MAX:-400}"
+             --seek-timeout "${SEEK_TIMEOUT:-60}")
+  [[ -n "${SEEK_DEVICE:-}" ]] && SEEK_ARGS+=(--seek-device "${SEEK_DEVICE}")
+fi
+
 exec python3 motion_server.py \
   --image-topic  "${IMAGE_TOPIC}" \
   --image-type   "${IMAGE_TYPE}" \
@@ -47,4 +64,5 @@ exec python3 motion_server.py \
   --robot-ip "${ROBOT_IP}" \
   --port "${SERVER_PORT}" \
   --goal-timeout-max "${GOAL_TIMEOUT_MAX:-60}" \
-  ${NL_ARGS[@]+"${NL_ARGS[@]}"}
+  ${NL_ARGS[@]+"${NL_ARGS[@]}"} \
+  ${SEEK_ARGS[@]+"${SEEK_ARGS[@]}"}

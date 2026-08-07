@@ -34,13 +34,15 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Image, CompressedImage
+from sensor_msgs.msg import Image, CompressedImage, LaserScan
 from cv_bridge import CvBridge
 
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel
+
+from seek import SeekBehaviour, SeekConfig, SeekParser
 
 
 def clamp(value, lo, hi):
@@ -53,12 +55,14 @@ def clamp(value, lo, hi):
 # --------------------------------------------------------------------------- #
 class MotionNode(Node):
     def __init__(self, image_topic, cmd_vel_topic, image_type="auto",
-                 robot_ip=None, cmd_timeout=0.4, odom_topic="/odom"):
+                 robot_ip=None, cmd_timeout=0.4, odom_topic="/odom",
+                 scan_topic="/scan"):
         super().__init__("motion_server")
         self.bridge = CvBridge()
         self.image_topic = image_topic
         self.cmd_vel_topic = cmd_vel_topic
         self.odom_topic = odom_topic
+        self.scan_topic = scan_topic
         self.cmd_timeout = cmd_timeout
 
         # Live network round-trip to the robot (dominant part of teleop latency).
@@ -73,6 +77,13 @@ class MotionNode(Node):
         cv2.putText(self._frame, "waiting for camera...", (120, 240),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
         self.frames_received = 0
+
+        # Laser scan, used by seek to turn "I can see it" into "it is 1.4 m away".
+        self._scan_lock = threading.Lock()
+        self._scan = None          # the LaserScan message itself
+        self._scan_time = 0.0      # time.monotonic() when it arrived
+        self.scan_received = 0
+        self._scan_dt = 0.0
 
         # Target velocity + deadman timestamp.
         self._vel_lock = threading.Lock()
@@ -122,6 +133,14 @@ class MotionNode(Node):
         self.create_subscription(Odometry, odom_topic, self._odom_cb, sensor_qos)
         self.get_logger().info(f"Subscribed to {odom_topic} (Odometry)")
 
+        # Laser scan. The same BEST_EFFORT profile is not optional here: the
+        # LDS-01 publishes BEST_EFFORT, so a default (RELIABLE) subscriber is
+        # QoS-incompatible and receives *nothing* -- rclpy logs
+        # "incompatible QoS ... No messages will be received" and otherwise
+        # looks exactly like a robot with its lidar switched off.
+        self.create_subscription(LaserScan, scan_topic, self._scan_cb, sensor_qos)
+        self.get_logger().info(f"Subscribed to {scan_topic} (LaserScan)")
+
         # Publish target velocity at 20 Hz; stop if no fresh command (deadman).
         self.create_timer(0.05, self._publish_cmd)
         self.get_logger().info(f"Publishing Twist on {cmd_vel_topic}")
@@ -167,6 +186,29 @@ class MotionNode(Node):
             frame = self._frame.copy()
         ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
         return buf.tobytes() if ok else None
+
+    def get_frame(self):
+        """(BGR copy, sequence number) for the detector.
+
+        The sequence number is what lets the seek loop tick faster than the
+        camera without paying for inference twice on one frame: the feed is
+        ~7 Hz over Wi-Fi while the control loop wants to run at 10-20 Hz, and
+        get_jpeg()-style access alone cannot tell a fresh frame from a repeat.
+        Returns BGR rather than JPEG because the detector would only have to
+        decode it again.
+        """
+        with self._frame_lock:
+            return self._frame.copy(), self.frames_received
+
+    def frame_width(self):
+        """Width of the published frame, in pixels.
+
+        Read rather than assumed: this camera publishes 480x640 portrait (the
+        publisher rotates 90 degrees to correct a rotated mount), and centring
+        divides by exactly this number.
+        """
+        with self._frame_lock:
+            return self._frame.shape[1]
 
     # --- odometry --------------------------------------------------------- #
     # Largest yaw jump between samples we'll believe. At 20 Hz a Burger turning
@@ -238,6 +280,91 @@ class MotionNode(Node):
                 return None
             x, y, yaw = self._odom
             return x, y, yaw, time.monotonic() - self._odom_time
+
+    # --- laser scan ------------------------------------------------------- #
+    # Fraction of the sector we allow to be nearer than the reported range.
+    # See front_range() for why this is not a median.
+    SCAN_PCT = 0.20
+
+    # Sectors to try, narrowest first, as (halfwidth_deg, minimum valid beams).
+    # A second, wider tier because thin targets genuinely disappear from a tight
+    # sector: centred on a chair 2.6 m away this robot read 0 valid beams out of
+    # 11 at +/-5 degrees and 3 out of 21 at +/-10 -- the pedestal base is mostly
+    # gaps at that range and everything behind it was past the 3.5 m limit, so a
+    # single narrow sector refused to range a target sitting in plain view.
+    #
+    # Widening is safe in the direction that matters: the reading is a robust
+    # MINIMUM, so a wider sector can only report something nearer, and erring
+    # near means stopping early. It cannot cause a late stop. The cost is
+    # precision -- at +/-20 degrees and 2.6 m the sector is about 1.8 m across,
+    # so the range may describe a doorframe beside the target rather than the
+    # target. Hence narrowest-first: the wide tier is a fallback, not the norm.
+    SCAN_TIERS = ((10.0, 3), (20.0, 6))
+
+    def _scan_cb(self, msg):
+        with self._scan_lock:
+            self._scan = msg
+            now = time.monotonic()
+            if self._scan_time:
+                dt = now - self._scan_time
+                self._scan_dt = dt if not self._scan_dt else \
+                    0.9 * self._scan_dt + 0.1 * dt
+            self._scan_time = now
+            self.scan_received += 1
+
+    def scan_stats(self):
+        """(age_s | None, hz | None, count), mirroring odom_stats()."""
+        with self._scan_lock:
+            if self._scan is None:
+                return None, None, self.scan_received
+            age = time.monotonic() - self._scan_time
+            hz = round(1.0 / self._scan_dt, 1) if self._scan_dt > 0 else None
+            return age, hz, self.scan_received
+
+    def front_range(self, tiers=None):
+        """(range_m, age_s) straight ahead, or (None, age_s) if unreadable.
+
+        Deliberately a robust MINIMUM (20th percentile of the valid beams in
+        the sector), not a median. Measured on this robot, a front sector of
+        +/-10 degrees read min 1.97 m against a median of 2.60 m: the median was
+        describing the wall behind the object while something sat two thirds of
+        a metre nearer. For "stop before you hit it" the nearest thing in the
+        path is the only correct quantity, and a median would have driven us
+        into it. A percentile rather than a bare min() because single spurious
+        short returns are common and would stop the robot early.
+
+        Invalid returns are dropped, not clamped. The LDS-01 reports a dropout
+        as 0.0, and a live sample had 251/360 beams valid with 0.0 sitting at
+        index 0 -- dead ahead -- so treating one beam as gospel, or reading a
+        dropout as "zero metres away", are both real failure modes here.
+        """
+        with self._scan_lock:
+            msg, t = self._scan, self._scan_time
+        if msg is None:
+            return None, None
+        age = time.monotonic() - t
+
+        n = len(msg.ranges)
+        if not n:
+            return None, age
+        # index == degrees CCW from forward on this unit (angle_min 0.0,
+        # increment 1 degree), but derive it from the header anyway so a
+        # different lidar doesn't silently read a random direction.
+        inc = msg.angle_increment or (2.0 * math.pi / n)
+        zero = int(round(-msg.angle_min / inc))
+        lo, hi = msg.range_min, msg.range_max
+
+        for halfwidth_deg, min_beams in (tiers or self.SCAN_TIERS):
+            span = int(round(math.radians(halfwidth_deg) / abs(inc)))
+            vals = []
+            for k in range(-span, span + 1):
+                r = msg.ranges[(zero + k) % n]
+                if math.isfinite(r) and lo <= r <= hi and r > 0.0:
+                    vals.append(r)
+            if len(vals) >= min_beams:
+                vals.sort()
+                return vals[int(self.SCAN_PCT * (len(vals) - 1))], age
+        return None, age
 
     # --- teleop ----------------------------------------------------------- #
     def set_velocity(self, linear, angular):
@@ -677,6 +804,42 @@ class MotionExecutor:
             if self._run_state is state:
                 self._progress = shown
 
+    # --- hooks used by SeekBehaviour -------------------------------------- #
+    # Public wrappers rather than letting seek.py reach into privates, so the
+    # "only the current motion may touch shared state" guard is enforced in one
+    # place no matter who is driving.
+    set_progress = _set_progress
+
+    def update_active(self, state, **fields):
+        """Merge live behaviour detail into the status readout."""
+        with self._lock:
+            if self._run_state is state and self._active is not None:
+                self._active.update(fields)
+
+    def set_goal(self, state, goal):
+        """Set the denominator of the progress bar once it becomes knowable.
+
+        A seek cannot state its goal up front the way "forward 1 m" can -- how
+        far it has to drive isn't known until the target has been found and
+        ranged -- so the bar stays empty until the approach begins.
+        """
+        with self._lock:
+            if self._run_state is state and self._active is not None:
+                self._active["goal"] = round(goal, 3)
+                self._progress = 0.0
+
+    def rotate_relative(self, state, degrees, action, speed="slow"):
+        """Turn by a fixed amount using the existing closed-loop angle goal.
+
+        Reused rather than reimplemented so the search sweep inherits the ramp,
+        the speed floor, the stall watchdog and the timeout that the typed
+        "rotate left 25 degrees" already has.
+        """
+        _, spec = self._plan_step(action, speed, "angle", degrees)
+        if spec["goal"] <= 0.0 or spec["cruise"] <= 0.0:
+            return "done"
+        return self._run_one(state, spec)
+
     def _begin_step(self, state, idx):
         """Hand the readout to the next step of a chain.
 
@@ -738,6 +901,82 @@ class MotionExecutor:
                         "elapsed_s": round(time.monotonic() - t_chain, 2),
                         "step": last + 1, "steps": len(specs),
                         "action": state["infos"][last]["action"],
+                    }
+                    self._run_state = None
+                    self._thread = None
+                    self._active = None
+
+    # --- seek ------------------------------------------------------------- #
+    @property
+    def max_ang(self):
+        return self._max_ang
+
+    @property
+    def approach_cruise(self):
+        """Forward speed while closing on a target.
+
+        Half of maximum: the stopping decision depends on a lidar sample and a
+        control tick, so the faster this is, the further the robot travels
+        after the range says stop. At 0.11 m/s one 20 Hz tick is 5 mm.
+        """
+        return self._max_lin * 0.5
+
+    def start_seek(self, behaviour, timeout_s):
+        """Run a seek on the same one-thread, one-cancel-event footing as a chain.
+
+        Everything that makes STOP work for typed motions -- _abort setting the
+        cancel event and joining, /cmd and /stop preempting, the 0.4 s deadman
+        underneath -- applies unchanged, because this is the same machinery.
+        A seek running on its own thread beside the executor would be a second
+        writer to set_velocity() and would break that guarantee.
+        """
+        info = {"action": "seek", "target": behaviour.target, "mode": "seek",
+                "goal": 0.0, "unit": "m", "lin": 0.0, "ang": 0.0,
+                "duration_s": 0.0, "timeout_s": round(timeout_s, 2),
+                "seek_state": "starting", "step": 1, "steps": 1}
+
+        self._abort(stop_on_exit=False)
+
+        state = {"cancel": threading.Event(), "stop_on_exit": True,
+                 "infos": [info]}
+        thread = threading.Thread(target=self._run_seek,
+                                  args=(state, behaviour), daemon=True)
+        with self._lock:
+            self._run_state = state
+            self._thread = thread
+            self._active = dict(info)
+            self._ends_at = time.monotonic() + timeout_s
+            self._progress = 0.0
+        thread.start()
+        return dict(info, started=True)
+
+    def _run_seek(self, state, behaviour):
+        t0 = time.monotonic()
+        reason = "done"
+        try:
+            reason = behaviour.run(state, state["cancel"])
+        except Exception as e:  # noqa: BLE001
+            # A crash in perception must not leave the robot driving. The
+            # deadman would catch it in 0.4 s regardless, but the finally below
+            # stops it now and the reason reaches the GUI instead of a
+            # silently-dead thread.
+            reason = f"seek failed ({type(e).__name__})"
+            self._node.get_logger().exception("seek behaviour raised")
+        finally:
+            if state["stop_on_exit"]:
+                self._node.stop()
+            with self._lock:
+                if self._run_state is state:
+                    active = self._active or {}
+                    self._last_result = {
+                        "reason": reason, "mode": "seek",
+                        "action": "seek", "target": behaviour.target,
+                        "goal": active.get("goal", 0.0),
+                        "progress": round(self._progress, 3), "unit": "m",
+                        "range_m": active.get("range_m"),
+                        "detections": behaviour.detections,
+                        "elapsed_s": round(time.monotonic() - t0, 2),
+                        "step": 1, "steps": 1,
                     }
                     self._run_state = None
                     self._thread = None
@@ -863,7 +1102,8 @@ def build_app(node: MotionNode, max_lin, max_ang,
               nl_max_distance=2.0, nl_max_angle=360.0, goal_timeout_max=60.0,
               nl_max_steps=5, nl_max_chain_distance=3.0,
               nl_max_chain_angle=720.0, nl_max_chain_seconds=120.0,
-              link_check=False):
+              link_check=False, detector=None, seek_parser=None,
+              seek_cfg=None):
     app = FastAPI()
     executor = MotionExecutor(node, max_lin, max_ang, nl_max_duration,
                               max_distance=nl_max_distance,
@@ -875,6 +1115,7 @@ def build_app(node: MotionNode, max_lin, max_ang,
     # counterpart, which is what guarantees none of them can bind on a single
     # command -- the backward-compatibility property, expressed as arithmetic.
     chain_caps = {"distance": nl_max_chain_distance, "angle": nl_max_chain_angle}
+    seek_cfg = seek_cfg or SeekConfig()
 
     @app.get("/", response_class=HTMLResponse)
     def index():
@@ -909,6 +1150,119 @@ def build_app(node: MotionNode, max_lin, max_ang,
         node.stop()
         return JSONResponse({"stopped": True})
 
+    def do_seek(text, dry_run=0):
+        """Shared by /nl routing and the explicit /seek endpoint."""
+        if seek_parser is None or detector is None:
+            return JSONResponse(
+                {"executed": False, "action": "seek",
+                 "message": "going to objects is disabled "
+                            "(start the server with --enable-seek)"},
+                status_code=503)
+
+        target, error = seek_parser.parse(text)
+        if error is not None:
+            return JSONResponse({"executed": False, "action": "seek",
+                                 "message": error})
+
+        result = {"action": "seek", "target": target,
+                  "stop_distance_m": seek_cfg.stop_distance,
+                  "max_travel_m": seek_cfg.max_travel}
+
+        # Checked here rather than inside the behaviour so a dry run reports it
+        # too -- the point of dry_run is to find out whether this would work.
+        age, _, _ = node.scan_stats()
+        if age is None or age > SeekBehaviour.SCAN_STALE:
+            result.update({
+                "executed": False,
+                "message": (f"I can see well enough to look for a {target}, but "
+                            "the lidar isn't reporting - I'd have no way to know "
+                            "when to stop")})
+            return JSONResponse(result)
+
+        if dry_run:
+            result.update({"executed": False, "dry_run": True,
+                           "message": f"would look for a {target}, then drive to "
+                                      f"{seek_cfg.stop_distance:g} m from it"})
+            return JSONResponse(result)
+
+        behaviour = SeekBehaviour(node, detector, executor, target, seek_cfg)
+        started = executor.start_seek(behaviour, seek_cfg.total_timeout)
+        result.update({"executed": bool(started["started"]),
+                       "timeout_s": started["timeout_s"],
+                       "message": f"looking for a {target}"})
+        return JSONResponse(result)
+
+    @app.post("/seek")
+    def seek(req: NLRequest, dry_run: int = 0):
+        """Go to an object named in plain English."""
+        text = (req.text or "").strip()
+        if not text:
+            return JSONResponse({"executed": False, "action": "seek",
+                                 "message": "say what to go to"})
+        return do_seek(text, dry_run)
+
+    @app.get("/detect")
+    def detect(target: str = "bottle", all: int = 1):
+        """Annotated snapshot of what the detector currently sees.
+
+        The robot does not move. This is the first verification stage: a
+        behaviour that drives at whatever the detector reports is only as good
+        as the detector, so being able to check that standing still -- and to
+        find the confidence a given object actually scores in this room's
+        lighting -- comes before letting it move.
+        """
+        if detector is None:
+            return JSONResponse({"error": "detection is disabled "
+                                          "(start with --enable-seek)"},
+                                status_code=503)
+        frame, seq = node.get_frame()
+        boxes = detector.detect_all(frame, target)
+        annotated = detector.annotate(frame, boxes, target, best_only=not all)
+        ok, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        if not ok:
+            return JSONResponse({"error": "could not encode frame"},
+                                status_code=500)
+        rng, _ = node.front_range()
+        return StreamingResponse(
+            iter([buf.tobytes()]), media_type="image/jpeg",
+            headers={"X-Detections": str(len(boxes)),
+                     "X-Best-Conf": "" if not boxes else f"{boxes[0].conf:.3f}",
+                     "X-Infer-Ms": str(detector.last_ms),
+                     "X-Front-Range-M": "" if rng is None else f"{rng:.3f}"})
+
+    @app.get("/video/detect")
+    def video_detect(target: str = "bottle"):
+        """Camera stream with detections drawn on it. The robot does not move.
+
+        Deliberately slower than /video. Inference is cheap (~19 ms) but this
+        runs for as long as someone leaves the tab open, and a seek in progress
+        wants the GPU more than a viewer does -- so it samples a few times a
+        second rather than at frame rate, and skips outright when the frame
+        hasn't changed.
+        """
+        if detector is None:
+            return JSONResponse({"error": "detection is disabled "
+                                          "(start with --enable-seek)"},
+                                status_code=503)
+
+        def gen():
+            last_seq, jpeg = -1, None
+            while True:
+                frame, seq = node.get_frame()
+                if seq != last_seq:
+                    last_seq = seq
+                    boxes = detector.detect_all(frame, target)
+                    ok, buf = cv2.imencode(
+                        ".jpg", detector.annotate(frame, boxes, target),
+                        [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    jpeg = buf.tobytes() if ok else None
+                if jpeg is not None:
+                    yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+                           + jpeg + b"\r\n")
+                time.sleep(0.2)      # ~5 fps
+        return StreamingResponse(
+            gen(), media_type="multipart/x-mixed-replace; boundary=frame")
+
     @app.post("/nl")
     def nl(req: NLRequest, dry_run: int = 0):
         """Parse a plain-English instruction and (unless dry_run) execute it."""
@@ -934,6 +1288,19 @@ def build_app(node: MotionNode, max_lin, max_ang,
             real chain, so a single command's message is byte-identical."""
             return msg if len(frags) == 1 else \
                 f'step {i + 1} of {len(frags)} ("{frags[i]}"): {msg}'
+
+        # Route to the seek parser before the driving parser gets a look in.
+        # Deterministic, and deliberately checked across every fragment: a seek
+        # buried at step 2 must be refused, not quietly handed to the driving
+        # parser, which would read "go to the bottle" as an unknown action and
+        # abandon the rest of the chain with a confusing message.
+        if any(SeekParser.looks_like_seek(f) for f in frags):
+            if len(frags) > 1:
+                return JSONResponse(
+                    {"executed": False, "action": "seek", "steps": len(frags),
+                     "message": "I can't combine going to an object with other "
+                                "steps yet - ask for it on its own"})
+            return do_seek(text, dry_run)
 
         # Refuse an over-long chain BEFORE parsing: no point paying five LLM
         # round-trips to reject something on a count we already know.
@@ -1114,6 +1481,7 @@ def build_app(node: MotionNode, max_lin, max_ang,
     @app.get("/nl/status")
     def nl_status():
         age, hz, count = node.odom_stats()
+        s_age, _, _ = node.scan_stats()
         return JSONResponse({"enabled": parser is not None,
                              "model": parser.model if parser else None,
                              "max_duration_s": nl_max_duration,
@@ -1122,11 +1490,19 @@ def build_app(node: MotionNode, max_lin, max_ang,
                              "max_steps": nl_max_steps,
                              "odom_ok": age is not None and age <= 1.0,
                              "odom_age_s": None if age is None else round(age, 2),
+                             "seek_enabled": detector is not None
+                                             and seek_parser is not None,
+                             "seek_stop_distance_m": seek_cfg.stop_distance,
+                             "scan_ok": s_age is not None
+                                        and s_age <= SeekBehaviour.SCAN_STALE,
+                             "scan_age_s": None if s_age is None else round(s_age, 2),
                              **executor.status()})
 
     @app.get("/status")
     def status():
         age, hz, count = node.odom_stats()
+        s_age, s_hz, s_count = node.scan_stats()
+        front, _ = node.front_range()
         return JSONResponse({
             "frames": node.frames_received,
             "image_topic": node.image_topic,
@@ -1141,6 +1517,13 @@ def build_app(node: MotionNode, max_lin, max_ang,
             "odom_count": count,
             "odom_hz": hz,
             "odom_age_ms": None if age is None else round(age * 1000),
+            "scan_topic": node.scan_topic,
+            "scan_count": s_count,
+            "scan_hz": s_hz,
+            "scan_age_ms": None if s_age is None else round(s_age * 1000),
+            # The metric the approach actually stops on, surfaced so it can be
+            # checked against a tape measure before trusting it to stop.
+            "front_range_m": None if front is None else round(front, 3),
         })
 
     return app
@@ -1205,6 +1588,18 @@ HTML_PAGE = """
   #nllog .ok { color:#6c6; padding-left:14px; }
   #nllog .no { color:#d0745e; padding-left:14px; }
   #nllog .pending { color:#888; padding-left:14px; font-style:italic; }
+  .nlhint { margin-top:8px; font-size:12px; color:#7d8a8a; line-height:1.5; }
+  .nlhint b { color:#9aa; font-weight:600; }
+  .nlhint code { background:#242424; padding:1px 5px; border-radius:4px;
+                 color:#8fb0d8; cursor:pointer; }
+  .nlhint code:hover { background:#2f2f2f; color:#b9d2f0; }
+  .vistoggle { margin-top:8px; display:none; align-items:center; gap:8px;
+               justify-content:center; font-size:13px; color:#9aa; }
+  .vistoggle input { width:130px; background:#2a2a2a; color:#eee; font-size:13px;
+                     border:1px solid #3a3a3a; border-radius:6px; padding:4px 8px; }
+  .vistoggle button { border:0; border-radius:6px; background:#2a2a2a; color:#eee;
+                      cursor:pointer; padding:5px 10px; font-size:13px; }
+  .vistoggle button.on { background:#3d7eff; color:#fff; }
 </style>
 </head>
 <body>
@@ -1212,6 +1607,10 @@ HTML_PAGE = """
   <div class="wrap">
    <div class="camwrap">
     <img id="cam" src="/video" alt="camera stream"/>
+    <div class="vistoggle" id="vistoggle">
+      <button id="visbtn" title="Draw boxes on the camera view showing what the detector finds. The robot does not move.">show what it sees</button>
+      <input id="vistarget" type="text" value="bottle" autocomplete="off"/>
+    </div>
     <div id="status">connecting…</div>
    </div>
 
@@ -1247,9 +1646,10 @@ HTML_PAGE = """
       <h2>Say it in plain English</h2>
       <div class="nlrow">
         <input id="nltext" type="text" autocomplete="off"
-               placeholder="e.g. move forward 1 meter"/>
+               placeholder="e.g. move forward 1 meter — or: go to the bottle"/>
         <button id="nlsend">Send</button>
       </div>
+      <div class="nlhint" id="nlhint"></div>
       <div id="nllog"></div>
     </div>
    </div>
@@ -1345,6 +1745,49 @@ const nlSend = document.getElementById('nlsend');
 const nlLog  = document.getElementById('nllog');
 if (NL_ENABLED) document.getElementById('nlwrap').style.display = '';
 
+// ---- seek ("go to the bottle") -------------------------------------------- //
+// Whether seek is available is a server-side fact (it needs the detector AND a
+// live lidar), so it is asked for rather than baked into the page: the same GUI
+// is served with it on and off, and a text box that silently does nothing is
+// worse than one that says what it can do.
+const nlHint    = document.getElementById('nlhint');
+const visToggle = document.getElementById('vistoggle');
+const visBtn    = document.getElementById('visbtn');
+const visTarget = document.getElementById('vistarget');
+const camImg    = document.getElementById('cam');
+let seekReady = false, visOn = false;
+
+async function initSeek() {
+  let s;
+  try { s = await (await fetch('/nl/status')).json(); } catch (e) { return; }
+  seekReady = !!s.seek_enabled;
+  if (!seekReady) return;
+  visToggle.style.display = 'flex';
+  const stop = (s.seek_stop_distance_m ?? 0.35).toFixed(2);
+  nlHint.innerHTML =
+    `<b>Go to an object:</b> try <code>go to the bottle</code>, ` +
+    `<code>find the red backpack</code> or <code>approach the chair</code>. ` +
+    `I'll turn until I see it, drive to it and stop ${stop} m short. ` +
+    `Only objects on the floor can be ranged.`;
+  // Click an example to load it -- the feature is only discoverable if the
+  // phrasing that works is in front of you.
+  nlHint.querySelectorAll('code').forEach(c => {
+    c.addEventListener('click', () => { nlText.value = c.textContent; nlText.focus(); });
+  });
+}
+
+function setVision(on) {
+  visOn = on;
+  visBtn.classList.toggle('on', on);
+  visBtn.textContent = on ? 'showing what it sees' : 'show what it sees';
+  const t = (visTarget.value || 'bottle').trim();
+  camImg.src = on ? `/video/detect?target=${encodeURIComponent(t)}`
+                  : '/video';
+}
+visBtn.addEventListener('click', () => setVision(!visOn));
+visTarget.addEventListener('change', () => { if (visOn) setVision(true); });
+initSeek();
+
 function logLine(cls, text) {
   const d = document.createElement('div');
   d.className = cls; d.textContent = text;
@@ -1389,8 +1832,40 @@ if (NL_ENABLED) {
 const progEl   = document.getElementById('prog');
 const progFill = document.getElementById('progfill');
 
+// What each stage of a seek is called in the readout. The internal names are
+// the wrong register for someone watching a robot cross a room.
+const SEEK_WORDS = {
+  starting: 'starting',
+  search:   'looking around',
+  center:   'turning to face it',
+  aiming:   're-aiming',
+  approach: 'driving to it',
+  arrived:  'arrived',
+};
+
 function renderMotion(m) {
   if (!m) { progEl.style.display = 'none'; return; }
+
+  // A seek reports where it has got to, not how far it has driven. Its goal
+  // isn't even known until the target has been found and ranged, so the
+  // distance-style readout below would show "0.00 of 0.00 m" for the whole
+  // search -- which reads as broken rather than as busy.
+  if (m.mode === 'seek') {
+    let s = `${SEEK_WORDS[m.seek_state] || m.seek_state || 'seeking'}`;
+    if (m.target) s += ` · ${m.target}`;
+    if (m.range_m != null) s += ` · ${m.range_m.toFixed(2)} m away`;
+    if (m.conf != null) s += ` · seen ${(m.conf * 100).toFixed(0)}%`;
+    velEl.textContent = s;
+    const goal = m.goal ?? 0;
+    if (goal > 0) {
+      progEl.style.display = '';
+      progFill.style.width = (m.progress_pct ?? 0) + '%';
+    } else {
+      progEl.style.display = 'none';
+    }
+    return;
+  }
+
   const chained = (m.steps ?? 1) > 1;
   let head = chained ? `step ${m.step}/${m.steps} · ` : '';
   head += m.action.replace('_',' ') + ' · ';
@@ -1525,12 +2000,34 @@ def main():
                     help="cap (degrees) on total rotation across a sequence")
     ap.add_argument("--nl-max-chain-seconds", type=float, default=120.0,
                     help="cap (seconds) on a sequence's worst-case running time")
+    # Seek: "go to the bottle". Needs the lidar as well as the camera.
+    ap.add_argument("--enable-seek", action="store_true",
+                    help="enable going to objects named in plain English")
+    ap.add_argument("--scan-topic", default="/scan",
+                    help="LaserScan topic used to range the target")
+    ap.add_argument("--seek-weights", default="yolov8m-world.pt",
+                    help="YOLO-World weights (open-vocabulary detector)")
+    ap.add_argument("--seek-device", default=None,
+                    help="torch device for detection (default: cuda if present)")
+    ap.add_argument("--seek-conf", type=float, default=0.10,
+                    help="detection confidence threshold (see vision.Detector "
+                         "for the measurements behind this default)")
+    ap.add_argument("--seek-stop-distance", type=float, default=0.35,
+                    help="how far short of the target to stop (meters, min 0.25)")
+    ap.add_argument("--seek-max-travel", type=float, default=2.5,
+                    help="cap (meters) on how far one approach may drive")
+    ap.add_argument("--seek-search-step", type=float, default=25.0,
+                    help="degrees rotated between looks while searching")
+    ap.add_argument("--seek-search-max", type=float, default=400.0,
+                    help="degrees swept before giving up the search")
+    ap.add_argument("--seek-timeout", type=float, default=60.0,
+                    help="cap (seconds) on one whole seek")
     args = ap.parse_args()
 
     rclpy.init()
     node = MotionNode(args.image_topic, args.cmd_vel_topic, args.image_type,
                       robot_ip=(args.robot_ip or None),
-                      odom_topic=args.odom_topic)
+                      odom_topic=args.odom_topic, scan_topic=args.scan_topic)
 
     spin = threading.Thread(
         target=lambda: rclpy.spin(node), daemon=True)
@@ -1545,6 +2042,33 @@ def main():
               f"{args.nl_max_angle:g}deg per step; up to {args.nl_max_steps} "
               f"steps per sequence)")
 
+    detector = seek_parser = seek_cfg = None
+    if args.enable_seek:
+        seek_cfg = SeekConfig(stop_distance=args.seek_stop_distance,
+                              max_travel=args.seek_max_travel,
+                              search_step_deg=args.seek_search_step,
+                              search_max_deg=args.seek_search_max,
+                              total_timeout=args.seek_timeout,
+                              conf=args.seek_conf)
+        from vision import Detector
+        device = args.seek_device
+        if device is not None and device.isdigit():
+            device = int(device)
+        detector = Detector(args.seek_weights, conf=args.seek_conf,
+                            device=device)
+        # Warm up before serving, not on the first command: the first inference
+        # costs ~0.7 s against ~19 ms for the rest, and paid later that lands as
+        # most of a second of the robot rotating without looking.
+        warm = detector.warmup()
+        seek_parser = SeekParser(args.llm_url, args.llm_model)
+        print(f"  Seek: {args.seek_weights} on device {detector.device} "
+              f"(warmup {warm:.1f}s, conf {args.seek_conf:g}); "
+              f"stops {seek_cfg.stop_distance:g}m short, "
+              f"max travel {seek_cfg.max_travel:g}m")
+        if not args.enable_nl:
+            print("  NOTE: --enable-seek without --enable-nl: use POST /seek "
+                  "(the GUI's text box needs --enable-nl)")
+
     app = build_app(node, args.max_lin, args.max_ang, parser=parser,
                     nl_max_duration=args.nl_max_duration,
                     nl_max_distance=args.nl_max_distance,
@@ -1554,7 +2078,9 @@ def main():
                     nl_max_chain_distance=args.nl_max_chain_distance,
                     nl_max_chain_angle=args.nl_max_chain_angle,
                     nl_max_chain_seconds=args.nl_max_chain_seconds,
-                    link_check=bool(args.robot_ip))
+                    link_check=bool(args.robot_ip),
+                    detector=detector, seek_parser=seek_parser,
+                    seek_cfg=seek_cfg)
     print(f"\n  Open the GUI at:  http://localhost:{args.port}\n")
     try:
         uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
