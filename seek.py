@@ -149,14 +149,50 @@ class SeekBehaviour:
     """SEARCH -> CENTER -> APPROACH -> done, on the executor's thread."""
 
     TICK = 0.05                  # matches the executor's closed-loop period
-    SETTLE_AFTER_STEP = 0.30     # let the image sharpen before believing it
+
+    # Pause after each search step before believing what the camera shows.
+    #
+    # This has to exceed the camera's end-to-end LATENCY, not merely its frame
+    # interval -- a frame that has just arrived still describes where the robot
+    # was pointing when it was captured. Measured on this link at 0.38 s (with
+    # the publisher at 5 FPS; it was 2.10 s at 30 FPS, which no plausible settle
+    # could have covered -- see scripts/robot_start.sh).
+    #
+    # Set too short, the search inspects the view from the PREVIOUS step and
+    # rotates straight past a target that is plainly visible on screen. That
+    # reads as "the detector can't see it" and is really "it isn't looking yet".
+    SETTLE_AFTER_STEP = 0.60
 
     # Centring. The deadband is a fraction of half-width, so it is an angle
     # regardless of resolution; 6% of half a frame is a couple of degrees.
     CENTER_DEADBAND = 0.06
     CENTER_GAIN = 1.2            # rad/s per unit of normalised pixel error
+
+    # Ceiling on how fast centring may turn -- set by camera LATENCY, not by
+    # what the motors can do.
+    #
+    # Centring is a closed loop on a feed that is ~0.38 s behind reality, so the
+    # robot keeps turning blind for that long after the target reaches centre.
+    # Uncapped (the executor's 2.84 rad/s) that blind arc is over 60 degrees,
+    # against a frame barely 44 degrees wide -- the target is thrown clean out of
+    # view and the loop reports "lost" while staring straight at it. Observed
+    # exactly that on "approach the bag": found at 100 degrees swept, then lost
+    # during centring.
+    #
+    # At 0.35 rad/s (20 deg/s) the blind arc is under 8 degrees, comfortably
+    # inside the frame. Correcting a target at the edge takes about a second,
+    # which is the right trade: slow and converging beats fast and losing it.
+    CENTER_MAX_ANG = 0.35
+
     CENTER_TIMEOUT = 12.0
-    CENTER_LOST_GRACE = 1.0      # s without a detection before giving up centring
+
+    # Grace periods are in seconds but what they really buy is FRAMES, so they
+    # had to grow when the camera went from ~7 FPS to 5 to fix the latency: the
+    # old 1.0 s was 7 frames and became 5. Marginal targets drop out for runs of
+    # several frames -- a bag scoring 0.12 was measured missing from 5 of 12
+    # consecutive stationary frames -- so a grace of a handful of frames trips
+    # on a target that is sitting still in plain view.
+    CENTER_LOST_GRACE = 2.5      # s without a detection before giving up centring
 
     APPROACH_GAIN = 0.5          # rad/s per unit error, while driving
 
@@ -193,7 +229,8 @@ class SeekBehaviour:
     # Only growth is filtered. A sudden DROP is either the target or something
     # that just moved into the path, and both of those must still stop us.
     RANGE_JUMP = 0.25
-    LOST_GRACE = 1.5             # s without a detection before calling it lost
+    LOST_GRACE = 2.5             # s without a detection before calling it lost
+                                 # (see CENTER_LOST_GRACE -- same frame-rate maths)
     RANGE_GRACE = 0.6            # s of unreadable lidar before refusing to drive
 
     # Abort if the lidar goes quiet. NOT the 0.5 s used for odometry: the
@@ -359,6 +396,10 @@ class SeekBehaviour:
                 return None, ("cancelled" if reason == "cancelled" else reason)
             swept += self.cfg.search_step_deg
             self.node.stop()
+            # The shared closed-loop turn reports its progress in DEGREES, and
+            # this readout is in metres-to-target. Left alone it surfaces as
+            # "progress: 23.3 m" on a seek that has not started driving yet.
+            self.executor.set_progress(state, 0.0)
             if cancel.wait(self.SETTLE_AFTER_STEP):
                 return None, "cancelled"
         return None, "not found"
@@ -398,7 +439,7 @@ class SeekBehaviour:
 
             # Positive error means the target is right of centre, and turning
             # right is a negative angular velocity (REP-103: yaw is CCW).
-            mag = min(abs(err) * self.CENTER_GAIN, self.executor.max_ang)
+            mag = min(abs(err) * self.CENTER_GAIN, self.CENTER_MAX_ANG)
             mag = max(mag, self.executor.MIN_ANG)
             self.node.set_velocity(0.0, -math.copysign(mag, err))
             cancel.wait(self.TICK)
@@ -484,7 +525,7 @@ class SeekBehaviour:
                 self.executor.update_active(
                     state, seek_state="aiming", err=round(err, 3),
                     conf=self.last_conf, target=self.target)
-                mag = min(abs(err) * self.CENTER_GAIN, self.executor.max_ang)
+                mag = min(abs(err) * self.CENTER_GAIN, self.CENTER_MAX_ANG)
                 self.node.set_velocity(0.0, -math.copysign(
                     max(mag, self.executor.MIN_ANG), err))
                 cancel.wait(self.TICK)
