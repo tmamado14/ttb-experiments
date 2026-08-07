@@ -229,6 +229,28 @@ class SeekBehaviour:
     # Only growth is filtered. A sudden DROP is either the target or something
     # that just moved into the path, and both of those must still stop us.
     RANGE_JUMP = 0.25
+
+    # How long outward-jumping readings may be rejected before the filter
+    # concedes that they, not its baseline, are the truth.
+    #
+    # Without this the filter LATCHES and can never recover. Rejecting a
+    # reading leaves the baseline untouched, so one spurious CLOSE reading
+    # poisons it permanently: a cat crossing the path dropped the range from
+    # 1.51 m to 0.62 m for a moment (accepted -- drops always are, since
+    # something entering the path must still stop us), and once it left, every
+    # true reading of ~1.2 m failed the 0.62 + 0.25 test forever. The robot
+    # then aborted with "lost range to target" while the raw lidar was reading
+    # the target perfectly, which is exactly as confusing as it sounds.
+    #
+    # 0.3 s is about 1.5 scans at 5 Hz: longer than a single-scan spike, so
+    # one-off noise still gets rejected, but it re-syncs 0.4 s into the streak
+    # against a 0.6 s RANGE_GRACE -- replayed against the measured failure,
+    # that recovers with 0.2 s to spare instead of aborting. It must stay
+    # comfortably under RANGE_GRACE or the latch simply returns.
+    #
+    # Re-baselining is safe: it does not weaken the stop test, which is
+    # evaluated against each fresh reading regardless of the baseline.
+    RANGE_RESYNC = 0.3
     LOST_GRACE = 2.5             # s without a detection before calling it lost
                                  # (see CENTER_LOST_GRACE -- same frame-rate maths)
     RANGE_GRACE = 0.6            # s of unreadable lidar before refusing to drive
@@ -464,6 +486,7 @@ class SeekBehaviour:
         t_ranged = t_seen
         seq, err, last_rng = -1, 0.0, rng
         t_scan_ok = None          # when the lidar first went quiet, if it has
+        t_reject = None           # when the current jump-rejection streak began
         while True:
             if cancel.is_set():
                 return "cancelled"
@@ -494,6 +517,12 @@ class SeekBehaviour:
                     t_scan_ok = now
                 elif now - t_scan_ok > self.SCAN_WAIT:
                     return "lidar stalled"
+                # No range is read on this path, so the RANGE_GRACE clock must
+                # not run through it either -- same reasoning as the aiming
+                # branch below. A stalled lidar is already handled, above, by
+                # its own SCAN_WAIT budget; letting it also burn down the range
+                # grace would abort on the first dropout after recovery.
+                t_ranged = now
                 cancel.wait(self.TICK)
                 continue
             t_scan_ok = None
@@ -528,6 +557,17 @@ class SeekBehaviour:
                 mag = min(abs(err) * self.CENTER_GAIN, self.CENTER_MAX_ANG)
                 self.node.set_velocity(0.0, -math.copysign(
                     max(mag, self.executor.MIN_ANG), err))
+                # RANGE_GRACE measures how long we have been UNABLE to read a
+                # range -- not how long since we last chose to look. Aiming
+                # deliberately takes no reading (see above), so without this the
+                # clock runs down through the whole turn and the very first
+                # dropout after it aborts with no grace left at all. That
+                # surfaced as "lost range to target" mid-approach, 1.28 m from a
+                # target in plain view, on a robot that had been driving fine.
+                #
+                # Resetting is safe precisely because this branch turns in
+                # place: nothing is moving forward on data we have not read.
+                t_ranged = now
                 cancel.wait(self.TICK)
                 continue
 
@@ -539,7 +579,17 @@ class SeekBehaviour:
             # down RANGE_GRACE and stops us instead of coasting on a stale value.
             if rng is not None and last_rng is not None and \
                     rng > last_rng + self.RANGE_JUMP:
-                rng = None
+                if t_reject is None:
+                    t_reject = now
+                if now - t_reject > self.RANGE_RESYNC:
+                    # Persistently disagreeing with the baseline means the
+                    # baseline is wrong, not the sensor. Re-sync rather than
+                    # reject forever -- see RANGE_RESYNC.
+                    t_reject = None
+                else:
+                    rng = None
+            else:
+                t_reject = None
             if rng is not None:
                 last_rng = rng
                 t_ranged = now
